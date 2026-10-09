@@ -96,20 +96,32 @@ fn read_cache(cache_dir: &Path) -> Option<Pricing> {
     };
     if let Some(map) = v.get("models").and_then(|m| m.as_object()) {
         for (id, price) in map {
-            let num = |k: &str| {
+            let num = |k: &str| -> f64 {
                 price
                     .get(k)
-                    .and_then(|x| x.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
+                    .and_then(|x| {
+                        x.as_f64()
+                            .or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    })
                     .unwrap_or(0.0)
             };
+            let cache_read = num("cache_read");
+            let cache_write = num("cache_write");
             p.models.insert(
                 id.clone(),
                 Price {
                     prompt: num("prompt"),
                     completion: num("completion"),
-                    cache_read: num("input_cache_read"),
-                    cache_write: num("input_cache_write"),
+                    cache_read: if cache_read > 0.0 {
+                        cache_read
+                    } else {
+                        num("input_cache_read")
+                    },
+                    cache_write: if cache_write > 0.0 {
+                        cache_write
+                    } else {
+                        num("input_cache_write")
+                    },
                 },
             );
         }
@@ -255,6 +267,14 @@ mod tests {
         assert_eq!(back.source, "cache");
         assert_eq!(back.len(), 1);
         assert!(back.lookup("zai", "glm-5.2").is_some());
+        let orig = p.models["z-ai/glm-5.2"];
+        let back_price = back.models["z-ai/glm-5.2"];
+        assert!(back_price.prompt > 0.0);
+        assert_eq!(back_price, orig);
+        let before = p.cost("zai", "glm-5.2", 100_000, 10_000, 5_000, 1_000);
+        let after = back.cost("zai", "glm-5.2", 100_000, 10_000, 5_000, 1_000);
+        assert!((before - after).abs() < 1e-12);
+        assert!(before > 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

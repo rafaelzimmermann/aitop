@@ -325,7 +325,7 @@ fn run_loop(
                     }
                     KeyCode::Tab => state.focus = (state.focus + 1) % count,
                     KeyCode::BackTab => state.focus = (state.focus + count - 1) % count,
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                    KeyCode::Char(c) if ('1'..='9').contains(&c) => {
                         let i = (c as usize) - ('1' as usize);
                         if i < count {
                             state.focus = i;

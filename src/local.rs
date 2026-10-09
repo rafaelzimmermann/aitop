@@ -62,6 +62,8 @@ pub fn collect(events: &[Event]) -> Stats {
     let mut out24 = 0u64;
     let mut secs24 = 0.0f64;
     let mut models: BTreeMap<String, ModelStat> = BTreeMap::new();
+    // output tokens that carry a measured generation time, per model
+    let mut timed_output: BTreeMap<String, u64> = BTreeMap::new();
 
     for e in events {
         s.total += e.tokens;
@@ -84,12 +86,18 @@ pub fn collect(events: &[Event]) -> Stats {
         }
         if e.ts > now - Duration::days(7) {
             s.tokens_7d += e.tokens;
-            daily[(6 - ((now - e.ts).num_days() as usize)).min(6)] += e.tokens;
+            let age_days = ((now - e.ts).num_days().max(0)) as usize;
+            if age_days < 7 {
+                daily[6 - age_days] += e.tokens;
+            }
             s.first_7d = Some(s.first_7d.map(|f| e.ts.min(f)).unwrap_or(e.ts));
         }
         if e.ts > now - Duration::hours(24) {
-            let idx = (24 - (((now - e.ts).num_seconds() / 3600) as usize)).min(23);
-            buckets[idx] += e.tokens;
+            // clock skew (a timestamp in the future) clamps to the current hour
+            let age_hours = ((now - e.ts).num_seconds().max(0) / 3600) as usize;
+            if age_hours < 24 {
+                buckets[23 - age_hours] += e.tokens;
+            }
         }
         if newest.map(|n| e.ts > n).unwrap_or(true) {
             newest = Some(e.ts);
@@ -116,6 +124,10 @@ pub fn collect(events: &[Event]) -> Stats {
         m.output += e.output;
         m.secs += e.secs;
         m.cost += e.cost;
+        if e.output > 0 && e.secs > 0.0 {
+            let cur = timed_output.get(&m.model).copied().unwrap_or(0) + e.output;
+            timed_output.insert(m.model.clone(), cur);
+        }
     }
 
     s.output_24h = out24;
@@ -127,8 +139,9 @@ pub fn collect(events: &[Event]) -> Stats {
     };
     s.last_tps = newest_tps.map(|(_, v)| v);
     for m in models.values_mut() {
+        let timed = timed_output.get(&m.model).copied().unwrap_or(0);
         m.tps = if m.secs > 0.0 {
-            Some(m.output as f64 / m.secs)
+            Some(timed as f64 / m.secs)
         } else {
             None
         };
@@ -599,5 +612,87 @@ mod tests {
         assert_eq!(s.tps_24h, Some(1000.0 / 30.0));
         assert_eq!(s.last_tps, Some(30.0)); // newest event: 600 / 20
         assert_eq!(s.models[0].tps, Some(1900.0 / 39.0));
+    }
+
+    #[test]
+    fn future_events_do_not_panic_or_corrupt_buckets() {
+        let now = Utc::now();
+        let events = vec![Event {
+            ts: now + Duration::hours(2),
+            tokens: 123,
+            output: 0,
+            secs: 0.0,
+            cost: 0.0,
+            model: "m".into(),
+        }];
+        let s = collect(&events);
+        assert_eq!(s.total, 123);
+        assert_eq!(s.spark.iter().sum::<u64>(), 123);
+        assert_eq!(s.spark[23], 123); // clamped to the current hour
+        assert_eq!(s.daily.iter().sum::<u64>(), 123);
+        assert_eq!(s.daily[6], 123);
+    }
+
+    #[test]
+    fn hourly_buckets_place_current_hour_at_end_and_preserve_slot_zero() {
+        let now = Utc::now();
+        let events = vec![
+            Event {
+                ts: now - Duration::minutes(30), // age_hours == 0 → bucket 23
+                tokens: 10,
+                output: 0,
+                secs: 0.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::hours(1), // age_hours == 1 → bucket 22
+                tokens: 20,
+                output: 0,
+                secs: 0.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::hours(23), // age_hours == 23 → bucket 0
+                tokens: 30,
+                output: 0,
+                secs: 0.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+        ];
+        let s = collect(&events);
+        assert_eq!(s.spark.len(), 24);
+        assert_eq!(s.spark[23], 10);
+        assert_eq!(s.spark[22], 20);
+        assert_eq!(s.spark[0], 30);
+        assert_eq!(s.spark.iter().sum::<u64>(), 60);
+    }
+
+    #[test]
+    fn model_throughput_excludes_untimed_output() {
+        let now = Utc::now();
+        let events = vec![
+            Event {
+                ts: now - Duration::minutes(1),
+                tokens: 100,
+                output: 100,
+                secs: 10.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::minutes(2),
+                tokens: 900,
+                output: 900,
+                secs: 0.0, // no measured generation time: excluded from tok/s
+                cost: 0.0,
+                model: "m".into(),
+            },
+        ];
+        let s = collect(&events);
+        assert_eq!(s.models[0].tps, Some(10.0)); // 100 timed output / 10s
+        assert_eq!(s.tps_24h, Some(10.0));
     }
 }

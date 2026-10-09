@@ -187,12 +187,14 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats, l: &Limits)
         &stats.first_7d,
     );
 
-    let rpm = stats.requests_5h as f64 / 5.0;
-    let mut r = Row::new(
-        "avg rpm",
-        pct(rpm as u64, l.rpm),
-        format!("{:.1} / {}", rpm, l.rpm),
-    );
+    // 5 hours = 300 minutes
+    let rpm = stats.requests_5h as f64 / 300.0;
+    let rpm_pct = if l.rpm > 0 {
+        (rpm / l.rpm as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let mut r = Row::new("avg rpm", rpm_pct, format!("{:.1} / {}", rpm, l.rpm));
     if l.rpm > 0 {
         r.set_cap(&l.rpm.to_string());
     }
@@ -425,7 +427,8 @@ fn codex_panel(cfg: &Config, pricing: &Pricing, v: &Value) -> Panel {
 
 pub fn codex(cfg: &Config, pricing: &Pricing) -> Panel {
     let mut p = Panel::new("codex");
-    let token = match cached_token(cfg).or_else(|| config::codex_access_token(cfg)) {
+    // An explicitly configured token always wins over a stale cached one.
+    let token = match config::codex_access_token(cfg).or_else(|| cached_token(cfg)) {
         Some(t) => t,
         None => {
             p.error = Some("no codex token (set CODEX_ACCESS_TOKEN or CODEX_AUTH_FILE)".into());
@@ -1685,6 +1688,34 @@ fn write_panel_cache(dir: &Path, p: &Panel) {
 
 /// A failed fetch falls back to the last good panel (marked stale); a successful
 /// one is persisted so the next failure can show something useful.
+/// Re-sanitizes a panel loaded from disk: the cache is written by whichever run
+/// came last, which may not have been started with `--redact`.
+fn redact_panel(p: &mut Panel) {
+    let fix = |s: &str| -> String {
+        let mut out: Vec<String> = vec![];
+        let mut prev = "";
+        for tok in s.split_whitespace() {
+            let hidden = tok.contains("@")
+                || tok.starts_with("sk-")
+                || (prev == "key" && tok != "[redacted]");
+            out.push(if hidden {
+                "[redacted]".into()
+            } else {
+                tok.into()
+            });
+            prev = tok;
+        }
+        out.join(" ")
+    };
+    p.subtitle = fix(&p.subtitle);
+    for l in &mut p.lines {
+        *l = fix(l);
+    }
+    for r in &mut p.rows {
+        r.detail = fix(&r.detail);
+    }
+}
+
 fn merge_cached(cfg: &Config, p: &mut Panel) {
     if p.error.is_some() {
         if let Some(cached) = read_panel_cache(&cfg.cache_dir, &p.name) {
@@ -1692,6 +1723,9 @@ fn merge_cached(cfg: &Config, p: &mut Panel) {
             *p = cached;
             p.stale = true;
             p.error = err;
+            if cfg.redact {
+                redact_panel(p);
+            }
         }
     } else {
         write_panel_cache(&cfg.cache_dir, p);
@@ -1979,7 +2013,7 @@ mod tests {
         assert_eq!(p.rows[1].pace.as_deref(), Some("pace ahead 30%")); // 50% expected after 12h
         assert_eq!(p.rows[2].pace.as_deref(), Some("pace ahead 23%")); // 42.9% expected after 3d
         assert_eq!(p.rows[3].label, "avg rpm");
-        assert_eq!(p.rows[3].detail, "3.0 / 30");
+        assert_eq!(p.rows[3].detail, "0.1 / 30"); // 15 requests / 300 minutes
         assert!(p.lines.iter().any(|l| l.contains("x-ratelimit-limit: 30")));
         assert!(p
             .lines
@@ -2004,7 +2038,7 @@ mod tests {
         };
         // rpm cap comes from the live header; day cap falls back to ZAI_LIMIT_DAY
         let p = zai_panel(&cfg, &s, &["x-ratelimit-limit: 60".to_string()], None);
-        assert_eq!(p.rows[3].detail, "12.0 / 60");
+        assert_eq!(p.rows[3].detail, "0.2 / 60"); // 60 requests / 300 minutes
         assert_eq!(p.rows[1].cap, Some(fmt_tokens(cfg.zai_limits.day)));
     }
 
@@ -2148,6 +2182,35 @@ mod tests {
         assert_eq!(failed.rows[0].pct, 42.0);
         assert!(failed.stale);
         assert_eq!(failed.error.as_deref(), Some("401 unauthorized"));
+        let _ = std::fs::remove_dir_all(&cfg.cache_dir);
+    }
+
+    #[test]
+    fn cached_panel_honors_redaction_on_fallback() {
+        let mut cfg = test_config();
+        cfg.cache_dir = std::env::temp_dir().join("aitop-panel-cache-redact-test");
+        cfg.redact = true;
+        let mut good = Panel::new("codex");
+        good.subtitle = "pro · me@example.com".into();
+        good.lines.push("key 3af1… · refreshed today".into());
+        good.rows
+            .push(Row::new("weekly", 10.0, "key 3af1… · sk-abc123".into()));
+        write_panel_cache(&cfg.cache_dir, &good);
+
+        let mut failed = Panel::new("codex");
+        failed.error = Some("401 unauthorized".into());
+        merge_cached(&cfg, &mut failed);
+        assert!(failed.stale);
+        assert!(!failed.subtitle.contains("@"));
+        assert!(failed.subtitle.contains("[redacted]"));
+        assert!(failed
+            .lines
+            .iter()
+            .all(|l| !l.contains("3af1") && !l.contains("sk-")));
+        assert!(failed
+            .rows
+            .iter()
+            .all(|r| !r.detail.contains("3af1") && !r.detail.contains("sk-")));
         let _ = std::fs::remove_dir_all(&cfg.cache_dir);
     }
 
