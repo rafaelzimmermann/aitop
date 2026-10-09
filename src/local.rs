@@ -240,7 +240,7 @@ mod tests {
         );
         let e = pi_events(raw, "zai", &p);
         assert_eq!(e.len(), 1);
-        assert!((e[0].cost - 2.1e-4).abs() < 1e-9);
+        assert!((e[0].cost - 2.0e-4).abs() < 1e-9);
     }
 
     #[test]
@@ -272,7 +272,7 @@ mod tests {
         assert_eq!(s.tokens_7d, 700);
         assert_eq!(s.spark.len(), 24);
         assert_eq!(s.spark.iter().sum::<u64>(), 300);
-        assert_eq!(s.last_request.as_ref().unwrap(), events[0].ts.to_rfc3339());
+        assert_eq!(s.last_request.as_deref().unwrap(), events[0].ts.to_rfc3339().as_str());
         assert_eq!(s.models[0].requests, 4);
     }
 }

@@ -75,14 +75,7 @@ fn env_float(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// GitHub token: env wins, then gh's own config file.
-fn github_token(h: &PathBuf) -> Option<String> {
-    for k in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Some(t) = env_opt(k) {
-            return Some(t);
-        }
-    }
-    let raw = std::fs::read_to_string(h.join(".config/gh/hosts.yml")).ok()?;
+fn parse_github_token(raw: &str) -> Option<String> {
     for line in raw.lines() {
         let line = line.trim();
         if line.starts_with("oauth_token:") {
@@ -93,6 +86,18 @@ fn github_token(h: &PathBuf) -> Option<String> {
         }
     }
     None
+}
+
+/// GitHub token: env wins, then gh's own config file.
+fn github_token(h: &PathBuf) -> Option<String> {
+    for k in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Some(t) = env_opt(k) {
+            return Some(t);
+        }
+    }
+    std::fs::read_to_string(h.join(".config/gh/hosts.yml"))
+        .ok()
+        .and_then(|raw| parse_github_token(&raw))
 }
 
 pub fn load() -> Config {
@@ -154,24 +159,104 @@ pub fn load() -> Config {
     }
 }
 
-/// Read the OAuth access token from codex's auth.json (preferred) or .env.
+fn parse_auth_token(raw: &str, key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    v.get("tokens")
+        .and_then(|t| t.get(key))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 pub fn codex_access_token(cfg: &Config) -> Option<String> {
     if let Some(t) = &cfg.codex_token {
         return Some(t.clone());
     }
-    let raw = std::fs::read_to_string(&cfg.codex_auth_file).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    v.get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
+    parse_auth_token(&std::fs::read_to_string(&cfg.codex_auth_file).ok()?, "access_token")
 }
 
 pub fn codex_refresh_token(cfg: &Config) -> Option<String> {
-    let raw = std::fs::read_to_string(&cfg.codex_auth_file).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    v.get("tokens")
-        .and_then(|t| t.get("refresh_token"))
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
+    parse_auth_token(&std::fs::read_to_string(&cfg.codex_auth_file).ok()?, "refresh_token")
+}
+
+#[cfg(test)]
+pub fn test_config() -> Config {
+    Config {
+        refresh_secs: 5,
+        home: PathBuf::from("/tmp/aitop-test-home"),
+        cache_dir: PathBuf::from("/tmp/aitop-test-cache"),
+        codex_auth_file: PathBuf::from("/tmp/aitop-test-home/.codex/auth.json"),
+        codex_token: None,
+        codex_base: "https://chatgpt.com/backend-api".into(),
+        codex_installation_id: None,
+        codex_client_id: "test-client".into(),
+        auth_base: "https://auth.openai.com".into(),
+        claude_credentials_file: PathBuf::from("/tmp/aitop-test-home/.claude/.credentials.json"),
+        anthropic_base: "https://api.anthropic.com".into(),
+        github_token: None,
+        github_base: "https://api.github.com".into(),
+        zai_key: None,
+        zai_base: "https://api.z.ai/api/coding/paas/v4".into(),
+        openrouter_key: None,
+        openrouter_base: "https://openrouter.ai/api/v1".into(),
+        codex_session_dir: PathBuf::from("/tmp/aitop-test-home/.codex/sessions"),
+        pi_session_dir: PathBuf::from("/tmp/aitop-test-home/.pi/agent/sessions"),
+        zai_limits: Limits { five_hour: 200_000, day: 1_000_000, week: 5_000_000, rpm: 30 },
+        pace_trigger: 10.0,
+        pricing_max_age_hours: 24,
+        providers: vec!["codex".into()],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_helpers_fall_back_to_defaults() {
+        std::env::remove_var("AITOP_TEST_NUM");
+        std::env::remove_var("AITOP_TEST_FLOAT");
+        std::env::remove_var("AITOP_TEST_OPT");
+        assert_eq!(env_num("AITOP_TEST_NUM", 5), 5);
+        assert_eq!(env_float("AITOP_TEST_FLOAT", 10.0), 10.0);
+        assert_eq!(env_opt("AITOP_TEST_OPT"), None);
+
+        std::env::set_var("AITOP_TEST_NUM", " 12 ");
+        std::env::set_var("AITOP_TEST_FLOAT", "7.5");
+        std::env::set_var("AITOP_TEST_OPT", "   ");
+        assert_eq!(env_num("AITOP_TEST_NUM", 5), 12);
+        assert_eq!(env_float("AITOP_TEST_FLOAT", 10.0), 7.5);
+        assert_eq!(env_opt("AITOP_TEST_OPT"), None, "blank env is not a value");
+    }
+
+    #[test]
+    fn gh_hosts_file_is_parsed() {
+        let raw = "github.com:\n  oauth_token: ght_abc123\n  user: me\n";
+        assert_eq!(parse_github_token(raw).as_deref(), Some("ght_abc123"));
+        assert_eq!(parse_github_token("github.com:\n  oauth_token: \"ght_quoted\"\n").as_deref(), Some("ght_quoted"));
+        assert_eq!(parse_github_token("github.com:\n  oauth_token: \n"), None);
+    }
+
+    #[test]
+    fn codex_tokens_come_from_auth_json() {
+        let dir = std::env::temp_dir().join("aitop-test-auth");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("auth.json");
+        std::fs::write(&path, r#"{"tokens":{"access_token":"tok-a","refresh_token":"tok-r"}}"#).unwrap();
+
+        let mut cfg = test_config();
+        cfg.codex_auth_file = path.clone();
+        assert_eq!(codex_access_token(&cfg).as_deref(), Some("tok-a"));
+        assert_eq!(codex_refresh_token(&cfg).as_deref(), Some("tok-r"));
+
+        // an explicit env token wins over the file
+        cfg.codex_token = Some("from-env".into());
+        assert_eq!(codex_access_token(&cfg).as_deref(), Some("from-env"));
+        assert_eq!(codex_refresh_token(&cfg).as_deref(), Some("tok-r"));
+
+        cfg.codex_auth_file = dir.join("missing.json");
+        cfg.codex_token = None;
+        assert_eq!(codex_access_token(&cfg), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

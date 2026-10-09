@@ -153,7 +153,7 @@ fn refresh_codex_token(cfg: &Config) -> Option<String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = fh.metadata().map(|m| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)));
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
             }
             let _ = fh.write_all(raw.as_bytes());
         }
@@ -302,10 +302,10 @@ pub fn claude(cfg: &Config, pricing: &Pricing) -> Panel {
     let tier = oauth.and_then(|o| o.get("rateLimitTier").or_else(|| o.get("rate_limit_tier")).and_then(|x| x.as_str())).unwrap_or("unknown tier");
     let expires = oauth
         .and_then(|o| o.get("expiresAt").or_else(|| o.get("expires_at")).and_then(|x| x.as_f64()))
-        .map(|ms| DateTime::from_timestamp_millis(ms as i64));
+        .and_then(|ms| DateTime::from_timestamp_millis(ms as i64));
     if let Some(e) = expires {
-        p.subtitle = format!("{tier} · token expires {}", e.to_utc().to_rfc3339());
-        if e.to_utc() <= Utc::now() {
+        p.subtitle = format!("{tier} · token expires {}", e.to_rfc3339());
+        if e <= Utc::now() {
             p.lines.push("⚠ token expired — run `claude` to refresh".to_string());
         }
     } else {
@@ -485,7 +485,7 @@ pub fn openrouter(cfg: &Config, pricing: &Pricing) -> Panel {
     }
 
     let now = Utc::now();
-    let day_elapsed = (now.num_seconds_from_midnight() as u64);
+    let day_elapsed = now.num_seconds_from_midnight() as u64;
     let week_elapsed = day_elapsed + (now.weekday().num_days_from_monday() as u64) * 86400;
     let month_elapsed = day_elapsed + (now.day0() as u64) * 86400;
 

@@ -39,7 +39,7 @@ impl Pricing {
         }
         self.models
             .iter()
-            .find(|(k, _)| k.ends_with(&format!("/{base}")) || k == base)
+            .find(|(k, _)| k.ends_with(&format!("/{base}")) || k.as_str() == base)
             .map(|(_, v)| v)
     }
 

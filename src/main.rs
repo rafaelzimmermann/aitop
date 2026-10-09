@@ -1,6 +1,8 @@
 mod config;
 mod local;
 mod model;
+mod pace;
+mod pricing;
 mod providers;
 mod ui;
 
@@ -67,6 +69,7 @@ fn print_plain(snap: &Snapshot) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load();
+    let pricing = pricing::load(&cfg.cache_dir, &cfg.openrouter_base, cfg.pricing_max_age_hours);
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -74,17 +77,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.iter().any(|a| a == "--json") {
-        let snap = providers::fetch_all(&cfg);
+        let snap = providers::fetch_all(&cfg, &pricing);
         println!("{}", serde_json::to_string_pretty(&snap)?);
         return Ok(());
     }
     if args.iter().any(|a| a == "--plain" || a == "-p") {
-        print_plain(&providers::fetch_all(&cfg));
+        print_plain(&providers::fetch_all(&cfg, &pricing));
         return Ok(());
     }
 
     if args.iter().any(|a| a == "--render-test") {
-        let snap = providers::fetch_all(&cfg);
+        let snap = providers::fetch_all(&cfg, &pricing);
         let state = ui::State { snapshot: snap, focus: 0, help: false, refresh_secs: cfg.refresh_secs };
         let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
         terminal.draw(|f| {
@@ -103,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut state = ui::State {
-        snapshot: providers::fetch_all(&cfg),
+        snapshot: providers::fetch_all(&cfg, &pricing),
         focus: 0,
         help: false,
         refresh_secs: cfg.refresh_secs,
@@ -115,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg = cfg.clone();
         let force = force.clone();
         thread::spawn(move || loop {
-            let snap = providers::fetch_all(&cfg);
+            let snap = providers::fetch_all(&cfg, &pricing);
             let _ = tx.send(snap);
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(cfg.refresh_secs.max(1)) {
