@@ -69,4 +69,9 @@ Each provider is `fetch → parse → panel_builder`; the JSON→Panel part is p
 - [x] throughput: output tok/s from the parent→assistant gap in pi session logs
       (`Event.secs`, `Stats.tps_24h`/`last_tps`, `ModelStat.tps`), and any provider name without
       a quota API (`PROVIDERS=ollama,strata`) falls back to that local-log panel
+- [x] TUI presentation upgrades: scrollable panels (`State.scroll`/`zoom`; `Enter` toggles
+      full-viewport zoom of the focused panel, `j`/`k` scroll detail lines when zoomed, `↑`/`↓`
+      cycle focus when not; scrollbar hint shows current scroll position), two-column tiling on
+      terminals ≥110 cols (`TWO_COL_MIN_WIDTH`), and clean `HH:MM:SS UTC` timestamps in panel
+      titles (`clock()` strips nanosecond tails)
 - [x] CI runs `cargo fmt --check`; the tree is formatted, keep it that way

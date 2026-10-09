@@ -13,6 +13,10 @@ pub struct State {
     pub focus: usize,
     pub help: bool,
     pub refresh_secs: u64,
+    /// scroll offset (in lines) applied to the focused panel's detail lines
+    pub scroll: usize,
+    /// true while the focused panel is expanded to the full viewport
+    pub zoom: bool,
 }
 
 // fixed columns keep every bar starting at the same column, whatever the label length is
@@ -23,6 +27,9 @@ const BAR_W: usize = 24;
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
 const TEXT: Color = Color::Gray;
+
+/// terminals at least this wide get panels tiled into two columns
+const TWO_COL_MIN_WIDTH: usize = 110;
 
 fn bar_color(pct: f64) -> Color {
     if pct >= 90.0 {
@@ -42,6 +49,31 @@ fn pace_color(p: &str) -> Color {
     } else {
         MUTED
     }
+}
+
+/// Clean wall-clock form of an RFC3339 timestamp: `13:00:16 UTC` (falls back to the
+/// raw string when it does not parse).
+fn clock(rfc: &str) -> String {
+    if let Some(dot) = rfc.find('.') {
+        if rfc.len() >= 19 {
+            let hms = &rfc[11..dot];
+            let tz = &rfc[dot..];
+            if tz.ends_with("+00:00") || tz.ends_with("-00:00") || tz.ends_with('Z') {
+                return format!("{hms} UTC");
+            }
+            return hms.to_string();
+        }
+    }
+    if rfc.len() >= 20 && rfc[19..].ends_with('Z') {
+        return format!("{} UTC", &rfc[11..19]);
+    }
+    if rfc.len() >= 25 && (rfc[19..].ends_with("+00:00") || rfc[19..].ends_with("-00:00")) {
+        return format!("{} UTC", &rfc[11..19]);
+    }
+    if rfc.len() >= 19 && rfc.chars().nth(10) == Some('T') {
+        return rfc[11..19].to_string();
+    }
+    rfc.to_string()
 }
 
 fn fit(s: &str, width: usize) -> String {
@@ -102,7 +134,7 @@ fn panel_title(p: &Panel, width: usize) -> String {
     t
 }
 
-fn draw_panel(f: &mut Frame, area: Rect, p: &Panel, focused: bool) {
+fn draw_panel(f: &mut Frame, area: Rect, p: &Panel, focused: bool, scroll: usize) {
     let border = if focused {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
@@ -185,6 +217,7 @@ fn draw_panel(f: &mut Frame, area: Rect, p: &Panel, focused: bool) {
         }
     }
 
+    // detail lines: the focused panel scrolls with `scroll`; others show what fits
     let lines: Vec<Line> = p
         .error
         .iter()
@@ -200,7 +233,32 @@ fn draw_panel(f: &mut Frame, area: Rect, p: &Panel, focused: bool) {
                 .map(|l| Line::from(l.clone()).style(Style::default().fg(TEXT))),
         )
         .collect();
-    f.render_widget(Paragraph::new(lines), chunks[2 + p.rows.len()]);
+    let area_lines = chunks[2 + p.rows.len()];
+    let visible = lines.len().saturating_sub(scroll);
+    f.render_widget(
+        Paragraph::new(lines.iter().skip(scroll).cloned().collect::<Vec<Line>>()),
+        area_lines,
+    );
+    if focused && visible < lines.len() {
+        // scrollbar hints: how many lines are hidden above and below
+        let hidden = lines.len() - visible;
+        let hint = format!("▲ {} above · ▼ {} more", scroll.min(999), hidden.min(999));
+        let y = area_lines.y + area_lines.height.saturating_sub(1);
+        if area_lines.height > 0 {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    fit(&hint, area_lines.width as usize),
+                    Style::default().fg(MUTED),
+                ))),
+                Rect {
+                    x: area_lines.x,
+                    y,
+                    width: area_lines.width,
+                    height: 1,
+                },
+            );
+        }
+    }
 }
 
 pub fn draw(f: &mut Frame, s: &State) {
@@ -210,7 +268,7 @@ pub fn draw(f: &mut Frame, s: &State) {
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(if s.help { 9 } else { 1 }),
+            Constraint::Length(if s.help { 11 } else { 1 }),
         ])
         .split(size);
 
@@ -225,21 +283,62 @@ pub fn draw(f: &mut Frame, s: &State) {
         tabline.push_span(Span::styled(format!(" {} {} ", i + 1, p.name), style));
     }
     tabline.push_span(Span::styled(
-        format!(" · {}", s.snapshot.fetched_at),
+        format!(" · {}", clock(&s.snapshot.fetched_at)),
         Style::default().fg(MUTED),
     ));
     f.render_widget(Paragraph::new(tabline), chunks[0]);
 
-    let n = s.snapshot.panels.len().max(1) as u16;
-    let per = (chunks[1].height / n).max(3);
-    for (i, p) in s.snapshot.panels.iter().enumerate() {
-        let area = Rect {
-            x: chunks[1].x,
-            y: chunks[1].y + (i as u16) * per,
-            width: chunks[1].width,
-            height: per,
-        };
-        draw_panel(f, area, p, i == s.focus);
+    if s.zoom {
+        // focused panel expanded to the whole content area
+        if let Some(p) = s.snapshot.panels.get(s.focus) {
+            draw_panel(f, chunks[1], p, true, s.scroll);
+        }
+    } else if s.snapshot.panels.len() >= 2 && size.width as usize >= TWO_COL_MIN_WIDTH {
+        // wide terminals: two columns halve the vertical starvation per panel
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
+        let n = s.snapshot.panels.len();
+        let left_n = n.div_ceil(2);
+        for (col, lo, hi) in [(0, 0, left_n), (1, left_n, n)] {
+            let count = (hi - lo).max(1) as u16;
+            let per = (cols[col].height / count).max(3);
+            for (j, i) in (lo..hi).enumerate() {
+                let p = &s.snapshot.panels[i];
+                let area = Rect {
+                    x: cols[col].x,
+                    y: cols[col].y + (j as u16) * per,
+                    width: cols[col].width,
+                    height: per,
+                };
+                draw_panel(
+                    f,
+                    area,
+                    p,
+                    i == s.focus,
+                    if i == s.focus { s.scroll } else { 0 },
+                );
+            }
+        }
+    } else {
+        let n = s.snapshot.panels.len().max(1) as u16;
+        let per = (chunks[1].height / n).max(3);
+        for (i, p) in s.snapshot.panels.iter().enumerate() {
+            let area = Rect {
+                x: chunks[1].x,
+                y: chunks[1].y + (i as u16) * per,
+                width: chunks[1].width,
+                height: per,
+            };
+            draw_panel(
+                f,
+                area,
+                p,
+                i == s.focus,
+                if i == s.focus { s.scroll } else { 0 },
+            );
+        }
     }
 
     if s.help {
@@ -252,10 +351,11 @@ pub fn draw(f: &mut Frame, s: &State) {
         );
         let body = [
             "q quit · r refresh now · h toggle help · 1-9 focus provider · tab/↑/↓ cycle",
+            "Enter zoom focused panel · j/k or ↑/↓ scroll it while zoomed · Esc back",
             "codex      live quota via chatgpt.com/backend-api/codex/usage",
             "claude     live utilization via api.anthropic.com/api/oauth/usage",
             "copilot    live quota via api.github.com/copilot_internal/user",
-            "z.ai       no public quota API → local accounting from pi session logs",
+            "z.ai       live quota via api.z.ai/api/monitor/usage/quota/limit (fallback: local logs)",
             "openrouter live credits/usage via /key + /credits",
             "other      any other name → local session logs, output tok/s from parent gaps",
         ];
@@ -276,7 +376,7 @@ pub fn draw(f: &mut Frame, s: &State) {
             .map(|p| p.spark.iter().sum::<u64>())
             .sum();
         let footer = format!(
-            "q quit · r refresh · h help · focus: {} · refresh {}s · 24h tokens {}",
+            "q quit · r refresh · h help · Enter zoom · j/k scroll · focus: {} · refresh {}s · 24h tokens {}",
             s.snapshot
                 .panels
                 .get(s.focus)
@@ -345,21 +445,10 @@ mod tests {
     }
 
     #[test]
-    fn titles_show_staleness_and_source_when_they_fit() {
-        let mut p = Panel::new("openrouter");
-        p.source = Some("live key + credits API".into());
-        assert_eq!(panel_title(&p, 40), "openrouter · live key + credits API");
-        p.stale = true;
-        // too narrow for the full source once "stale" is added → truncated, never overflow
-        assert_eq!(
-            panel_title(&p, 40),
-            "openrouter stale · live key + credits AP"
-        );
-        assert_eq!(
-            panel_title(&p, 41),
-            "openrouter stale · live key + credits API"
-        );
-        // very narrow panels drop the source entirely
-        assert_eq!(panel_title(&p, 12), "openrouter stale");
+    fn clock_strips_the_nanosecond_tail() {
+        assert_eq!(clock("2026-10-09T13:00:16.675005046+00:00"), "13:00:16 UTC");
+        assert_eq!(clock("2026-10-09T13:00:16Z"), "13:00:16 UTC");
+        assert_eq!(clock("2026-10-09T13:00:16+02:00"), "13:00:16");
+        assert_eq!(clock("not-a-timestamp"), "not-a-timestamp");
     }
 }

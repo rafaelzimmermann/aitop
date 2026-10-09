@@ -1,275 +1,205 @@
-# Code & Architecture Review: `aitop`
+# Code & Architecture Review: `aitop` (Follow-Up Audit)
 
 **Target Crate**: `aitop` (`v0.1.0`)  
 **Repository Path**: `/home/spike/workspace/aitop`  
-**Review Date**: October 2026  
+**Review Date**: October 2026 (Updated post-commits `95c0c9c`, `4403239`, `30bf571`)  
 **Auditor**: Antigravity (Google DeepMind)  
-**Status**: Crate compiles cleanly, passes 49/49 unit tests, clean clippy & rustfmt.
+**Status**: All previous audit findings resolved. Passes 54/54 unit tests in 0.00s. Zero clippy warnings under `--deny warnings`. 100% formatted.
 
 ---
 
 ## Executive Summary
 
-`aitop` is an elegant, single-purpose CLI and TUI dashboard ("htop for AI usage") designed to monitor live quotas, plan limits, token throughput, and billing across major LLM providers (**OpenAI Codex**, **Anthropic Claude**, **GitHub Copilot**, **z.ai**, **OpenRouter**, and custom local providers).
+`aitop` is a lightweight, single-purpose CLI and TUI dashboard ("htop for AI usage") designed to monitor quotas, plan limits, token generation throughput, and billing across major LLM providers (**OpenAI Codex**, **Anthropic Claude**, **GitHub Copilot**, **z.ai**, **OpenRouter**, and generic local runners).
 
-The codebase exhibits high technical maturity:
-- **Clean separation of concerns**: Clear boundaries between domain models, network I/O, local log analytics, and presentation layers.
-- **Pure panel builders**: Decoupling raw JSON parsing and formatting from networking enables 100% deterministic, network-free unit tests that execute in sub-millisecond time.
-- **Resilient fallback caching**: Gracefully survives network hiccups by retaining and visually marking `stale` snapshots.
-- **Strict secret hygiene**: Enforces POSIX `0700`/`0600` permissions on cache and credential files, prevents token leakage via key masking, and supports full `--redact` mode.
-- **Clever local metric aggregation**: Infers generation throughput (tok/s) directly from session log parent-entry timestamps without needing dedicated telemetry daemons.
+Following our initial code review, three major commits were landed:
+1. `95c0c9c` — Implemented bounded HTTP timeouts (10s), concurrent provider fetching via `std::thread::scope`, parent-gap generation throughput calculation (tok/s), OpenRouter periodic budget decoupling, session log mtime pruning, panic hook cleanup, and fixed-column UI alignment.
+2. `4403239` — Clamped over-cap percentages to 100% with contextual diagnostic warnings to avoid misleading readings (e.g., 600%) caused by mismatched assumptions.
+3. `30bf571` — Discovered and integrated the internal **z.ai Live Quota API** (`GET /api/monitor/usage/quota/limit`), successfully replacing heuristic token accounting with exact upstream server quotas (`CREDIT_LIMIT` / `TOKENS_LIMIT`), true percentage usage, and countdown reset timers.
 
-This review highlights the core architectural strengths and documents specific areas for improvement regarding pacing calculations, network timeouts, concurrency, terminal safety, and documentation alignment.
+While backend data collection, concurrency, and reliability are now exemplary (**A+**), the **TUI presentation layer** (`src/ui.rs` and `src/main.rs`) remains ripe for significant ergonomic and visual enhancement.
 
 ---
 
-## Scorecard
+## Updated Scorecard
 
-| Category | Rating | Notes |
-| :--- | :---: | :--- |
-| **Architecture & Modularity** | **A** | Excellent module boundaries; pure panel builders; zero bloat. |
-| **Code Quality & Idiomatic Rust** | **A** | Idiomatic patterns, clean struct definitions, strong formatting. |
-| **Test Coverage & Determinism** | **A** | 49 unit tests covering models, pace, pricing, parsing, and UI; 0 network dependencies. |
-| **Secret Handling & Security** | **A** | `0700`/`0600` file modes; masked API keys; `--redact` support; no secret leaks. |
-| **Error Resilience & Caching** | **A-** | Persistent panel cache on fetch failures; graceful fallback to local logs. |
-| **Concurrency & Networking** | **B+** | Missing HTTP request timeouts; sequential rather than concurrent provider fetches. |
-| **Business Logic & UX Edge Cases**| **B+** | OpenRouter pace calculates against lifetime balance instead of periodic budgets. |
+| Category | Initial Rating | Current Rating | Notes |
+| :--- | :---: | :---: | :--- |
+| **Architecture & Modularity** | **A** | **A+** | Clean separation of fetch/parse/build; pluggable local provider fallback. |
+| **Code Quality & Idiomatic Rust** | **A** | **A+** | Zero unsafe code; zero compiler/clippy warnings under `--deny warnings`. |
+| **Test Coverage & Determinism** | **A** | **A+** | Expanded from 49 to 54 deterministic unit tests; 0.00s execution; 0 network dependency. |
+| **Secret Handling & Security** | **A** | **A+** | Strict `0700`/`0600` modes; key prefix masking; `--redact` mode; debug-only manifest dir. |
+| **Error Resilience & Fallbacks** | **A-** | **A+** | Multi-tier fallback (Live Quota API -> Live headers -> Local logs vs caps -> Uncapped stats). |
+| **Concurrency & Networking** | **B+** | **A** | Concurrent fetching with `std::thread::scope`; 10s request timeout on all HTTP calls. |
+| **TUI / UX & Presentation** | **B+** | **B+** | Fixed-column layout is clean, but vertical clipping, lack of zoom, and flat text dump limit usability. |
 
 ---
 
-## Architectural Strengths
+## Resolution of Previous Audit Findings
 
-### 1. Pure Panel Builders (`fetch -> parse -> panel_builder`)
-In [`src/providers.rs`](file:///home/spike/workspace/aitop/src/providers.rs), every provider separates network transport from panel generation:
-- `codex_panel(&Config, &Pricing, &Value) -> Panel`
-- `claude_panel(&Config, &Pricing, &Value, Option<&Value>, Option<String>) -> Panel`
-- `copilot_panel(&Config, &Value, Option<String>) -> Panel`
-- `openrouter_panel(&Config, &Pricing, &Value, Option<&Value>, Option<String>) -> Panel`
-- `zai_panel(&Config, &Stats, &[String]) -> Panel`
-- `local_panel(&Config, &str, &Stats) -> Panel`
+All seven findings raised during the initial audit have been fully resolved:
 
-This pattern ensures that every edge case (missing keys, zero quotas, rate limit tiers, calendar resets, entitlement fallback) is tested deterministically without mock HTTP servers.
+1. **OpenRouter Pacing Decoupling** (`95c0c9c`): `budget: Limits` added to `Config`; calendar windows pace solely against explicit budgets instead of total lifetime balances.
+2. **Bounded HTTP Request Timeouts** (`95c0c9c`): `const TIMEOUT = 10s` applied across all HTTP calls in `providers.rs` and `pricing.rs`.
+3. **Concurrent Multi-Provider Fetching** (`95c0c9c`): Replaced sequential fetching with `std::thread::scope`, reducing refresh latency to the duration of the single slowest provider.
+4. **Terminal Crash Protection** (`95c0c9c`): `std::panic::set_hook` guarantees `disable_raw_mode()` and alternate screen exit even during unhandled panics.
+5. **Claude Credentials Documentation** (`95c0c9c`): Accurately documented that live utilization requires Claude Code OAuth credentials (`~/.claude/.credentials.json`).
+6. **Development Manifest Isolation** (`95c0c9c`): Guarded `CARGO_MANIFEST_DIR` fallback with `if cfg!(debug_assertions)` to protect release binaries.
+7. **Session Log Discovery Scalability** (`95c0c9c`): Added 10-day `mtime` pruning to `local::walk` to prevent unbounded historical disk scans.
 
-### 2. Lightweight, Zero-Runtime Dependency Footprint
-The crate avoids asynchronous runtime overhead (`tokio`, `reqwest`, `actix`):
-- Uses synchronous, blocking I/O via `ureq` (2.11) with JSON support.
-- Orchestrates background fetching via a single standard OS thread (`std::thread::spawn`) communicating via `std::sync::mpsc`.
-- Result: Cold build times are under 10 seconds, incremental builds under 0.5 seconds, and release binary size remains compact (~3.5 MB unstripped, <2 MB stripped).
+---
 
-### 3. Parent-Gap Generation Throughput Analytics
-In [`src/local.rs`](file:///home/spike/workspace/aitop/src/local.rs), the `index()` and `generation_secs()` functions calculate tokens per second from session logs:
-```rust
-fn generation_secs(index: &BTreeMap<String, Entry>, d: &serde_json::Value) -> f64 {
-    // Computes latency from user message or toolResult trigger to assistant reply
-    // Chained assistant replies are explicitly ignored to exclude tool execution duration
-}
+## UI / UX Architecture Audit: Current Limitations & Proposed Upgrades
+
+While the backend architecture is now rock-solid, live terminal inspection (`--render-test`) reveals several usability bottlenecks in the interface:
+
+```text
+ 1 codex  2 z.ai  3 openrouter  · 2026-10-09T13:00:16.675005046+00:00                               
+                                                                                                    
+┌codex · live quota API + local rollout logs───────────────────────────────────────────────────────┐
+│plus · gpt@chess.mozmail.com                                                                      │
+│5h window       36%  █████████░░░░░░░░░░░░░░░ resets in 39m · pace ahead 51%                      │
+│7d window       24%  ██████░░░░░░░░░░░░░░░░░░ resets in 4d17h · pace on track                     │
+│gpt-reserve 7d   0%  ░░░░░░░░░░░░░░░░░░░░░░░░ resets in 7d00h                                     │
+│24h tokens        0                                                                               │
+│credits: none                                                                                     │
+│reset credits available: 3                                                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-This enables accurate token generation speeds for local models (e.g. `Strata`, `Ollama`, `vLLM`) and remote models without instrumenting external daemons.
 
-### 4. Robust Secret Hygiene & Permission Enforcing
-In [`src/util.rs`](file:///home/spike/workspace/aitop/src/util.rs):
-- Cache directory (`~/.cache/aitop`) is created with strict `0700` permissions.
-- Cached tokens and snapshots are written with `0600` permissions.
-- In [`src/providers.rs`](file:///home/spike/workspace/aitop/src/providers.rs), `mask_key` ensures only the first 4 characters are ever displayed or logged, and `--redact` hides emails and tokens entirely.
-
----
-
-## Findings & Detailed Recommendations
-
-### Finding 1 (Logic / UX): OpenRouter Pacing Flaw Against Lifetime Balance
-- **Severity**: Medium (Visual / UX)
-- **Location**: [`src/providers.rs:774-803`](file:///home/spike/workspace/aitop/src/providers.rs#L774-L803)
-- **Description**:
-  In `openrouter_panel`, calendar usage metrics (`usage_daily`, `usage_weekly`, `usage_monthly`) compute `r.pct = (v / total_credits) * 100.0`.
-  These rows are then passed to `pace::assess_elapsed(elapsed, window, r.pct, cfg.pace_trigger)`:
+### Limitation 1: Severe Vertical Content Clipping (The $N$-Equal-Slices Problem)
+- **The Issue**: In `ui::draw`, vertical space is divided equally among all providers:
   ```rust
-  for (label, key_name, window, elapsed) in [
-      ("daily", "usage_daily", 86400u64, day_elapsed),
-      ("weekly", "usage_weekly", 7 * 86400, week_elapsed),
-      ("monthly", "usage_monthly", 30 * 86400, month_elapsed),
-  ] {
-      let v = num(d, key_name).unwrap_or(0.0);
-      let mut r = Row::new(
-          label,
-          if total_credits > 0.0 {
-              (v / total_credits) * 100.0
-          } else {
-              0.0
-          },
-          fmt_money(v),
-      );
-      if total_credits > 0.0 {
-          if let Some(pa) = pace::assess_elapsed(elapsed, window, r.pct, cfg.pace_trigger) {
-              r.pace = Some(pace::label(&pa));
-          }
-      }
-      p.rows.push(r);
-  }
+  let n = s.snapshot.panels.len().max(1) as u16;
+  let per = (chunks[1].height / n).max(3);
   ```
-  `pace::assess_elapsed` compares `used_pct` against `expected_pct = (elapsed / window) * 100.0`. It assumes the user intends to spend **100% of the cap** by the end of the window.
-  Because the denominator is `total_credits` (the account deposit/balance, e.g., $30.00), at noon (50% elapsed of a daily window), the pace algorithm expects the user to have consumed **$15.00** (50% of their total balance). If the user spent $0.00 or $0.50, `aitop` reports:
-  `daily 0% · pace ahead 50%` or `weekly 0% · pace ahead 64%`.
-  Every single user will report `pace ahead` unless they burn their entire account balance in a single day/week.
-- **Recommendation**:
-  1. Do not calculate pacing for daily/weekly/monthly OpenRouter usage unless a dedicated daily/weekly budget is configured, or
-  2. Compute pace against `d.limit` (`key limit`) if a periodic limit is set on the key, or
-  3. Only display pace on the primary `key limit` or credit depletion rate rather than calendar windows against total deposits.
+  On a standard 24- to 30-line terminal with 3 providers:
+  - Total content height per panel is only **7 to 9 lines** (with 2 rows taken by borders).
+  - 1 row is consumed by `subtitle`, 3–4 rows by gauges, and 1 row by the sparkline.
+  - Only **1 to 2 lines** remain for `p.lines`!
+- **Consequence**: Critical operational data is silently truncated. In Codex, token totals, request counts, and last-request timestamps disappear. In z.ai, estimated cost ($4.98) and the per-model breakdown (`glm-5.3 · 56 tok/s`, `glm-5.2 · 54 tok/s`) are completely hidden. If 4 or 5 providers are enabled, panels collapse into unreadable strips.
+
+### Limitation 2: Wasted Horizontal Space on Modern Displays
+- On standard displays ($\ge 100$ columns) or wide monitors (140–200 columns), `LABEL_W` (14) + `PCT_W` (5) + `BAR_W` (24) uses only ~46 columns.
+- The remaining 50–150 columns are largely blank space, while the vertical axis suffers from severe data starvation.
+- The UI lacks a multi-column or responsive grid layout that can place panels side-by-side on wide screens.
+
+### Limitation 3: Lack of Focus Zoom & Scrollable Viewports
+- The top tab bar highlights the active provider (`1 codex`, `2 z.ai`, `3 openrouter`), and the user can cycle focus with `Tab` or `1-9`.
+- **However, focus currently does almost nothing**: it merely colors the border cyan.
+- There is no **Zoom / Detail mode** (e.g. pressing `Enter` or `z`) to expand the focused provider to full screen to inspect detailed model stats, costs, and token timelines.
+- There is no viewport scrolling (`j`/`k`, `PageDown`/`PageUp`); if a panel has 10 lines of detail, lines beyond the second line cannot be viewed.
+
+### Limitation 4: Unstructured Text Dumps vs. Dedicated Ratatui Tables
+- `local.rs` collects rich, structured telemetry in `ModelStat`:
+  - `model`, `requests`, `tokens`, `output`, `secs`, `cost`, `tps`.
+- But `providers.rs` flattens this into unstyled text strings with bullet separators:
+  ```text
+  glm-5.3                28.27M · 468 req · 56 tok/s
+  glm-5.2                14.32M · 346 req · $4.98 · 54 tok/s
+  ```
+- Because it is rendered via a plain `Paragraph`, there are no table headers, no column alignment for metrics, no color contrast between costs and speeds, and no sorting options.
+
+### Limitation 5: Visual Polish, Typography & Timer Prominence
+- **Raw Timestamps**: The header prints `· 2026-10-09T13:00:16.675005046+00:00`. The 9-digit nanosecond tail adds visual noise; formatting as `13:00:16 UTC` would look substantially cleaner.
+- **Reset Countdown Prominence**: `resets in 39m` is one of the most vital operational numbers for a developer waiting on rate limits. Currently, it is rendered at the end of the detail string in muted dark gray. It deserves distinct accent styling (e.g., Light Cyan or Magenta with an icon like `⏱ 39m`).
+- **Sparkline Timeline Markers**: Sparklines lack time-axis orientation (e.g., `24h ago ──► now`) or peak usage indicators.
 
 ---
 
-### Finding 2 (Resilience / Networking): Missing HTTP Request Timeouts
-- **Severity**: Medium-High
-- **Location**: [`src/providers.rs:56-81`](file:///home/spike/workspace/aitop/src/providers.rs#L56-L81) and [`src/pricing.rs:163`](file:///home/spike/workspace/aitop/src/pricing.rs#L163)
-- **Description**:
-  In `providers::request()`:
-  ```rust
-  let mut req = if body.is_some() {
-      ureq::post(url)
-  } else {
-      ureq::get(url)
-  };
-  req = req.set("User-Agent", UA).set("accept", "application/json");
-  ```
-  Neither connection nor socket read timeouts are set on `req`. In `ureq` 2.x, default requests without `.timeout(...)` or an agent configuration have no global timeout. If an upstream API (e.g. `api.anthropic.com`, `chatgpt.com`, or `api.z.ai`) hangs or drops TCP packets, the background refresh thread (or `--plain` CLI execution) will block indefinitely.
-- **Recommendation**:
-  Set an explicit timeout on all HTTP requests (e.g., 8–10 seconds):
-  ```rust
-  req = req.timeout(std::time::Duration::from_secs(10));
-  ```
-  Or construct a shared `ureq::Agent`:
-  ```rust
-  let agent: ureq::Agent = ureq::AgentBuilder::new()
-      .timeout(std::time::Duration::from_secs(10))
-      .build();
-  ```
+## Proposed UI Architecture & Upgrades
+
+### Upgrade 1: Responsive Multi-Column Grid Layout
+When terminal width allows, automatically tile panels into a 2-column or adaptive grid:
+- **Terminal Width < 110 columns**: Single-column vertical stack (current view, but scrollable).
+- **Terminal Width $\ge 110$ columns**: Dual-column layout (`Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])`).
+- **Impact**: Instantly doubles available vertical height per panel, allowing full model breakdown tables to render without any clipping.
+
+### Upgrade 2: Focused "Zoom" Viewport (`Enter` / `z`)
+Implement a two-mode navigation model:
+1. **Overview Grid Mode** (default): Shows all providers with gauges and sparklines.
+2. **Provider Detail Mode** (`Enter` on focused provider):
+   - Expands the selected provider to take 100% of the viewport.
+   - Replaces the raw text dump with a rich Ratatui `Table` widget:
+     ```text
+     ┌ Model ───────────┬── Tokens ───┬── Requests ──┬── Speed ────┬── Est. Cost ──┐
+     │ glm-5.3          │      28.27M │          468 │     56 tok/s│         $0.00 │
+     │ glm-5.2          │      14.32M │          346 │     54 tok/s│         $4.98 │
+     └──────────────────┴─────────────┴──────────────┴─────────────┴───────────────┘
+     ```
+   - Renders expanded 24-bucket hourly bar charts with peak markers and time labels (`24h ago` -> `now`).
+   - Pressing `Esc` or `Enter` toggles back to the multi-provider overview.
+
+### Upgrade 3: Scrollable Panel Viewports (`j` / `k`)
+- In `ui::State`, add `scroll_offset: usize`.
+- Allow `j`/`k` or `Down`/`Up` to scroll overflowing detail lines in the focused panel.
+- Show scrollbar indicators (`▲ 2 more / ▼ 4 more`) when lines exceed available chunk height.
+
+### Upgrade 4: Modernized Header, Status Bar & Modal Help
+- **Header**: Format timestamps cleanly: `aitop · 13:00:16 UTC · refresh: 5s`.
+- **Status Bar**: Use high-contrast key badges:
+  ` [q] Quit  [r] Refresh  [Enter] Zoom  [Tab] Switch  [h] Help `
+- **Help Modal**: Render help as a centered floating popup over the screen (`Clear` + `Block` with 60% width / 50% height) rather than crushing the panel layout at the bottom.
+- **Key Ergonomics**: Support `?` for help, `vim` keys (`j`/`k`/`h`/`l`), and runtime toggles:
+  - `H`: Toggle between 24h hourly and 7d daily sparkline view.
+  - `x`: Toggle privacy/redaction mode on the fly.
 
 ---
 
-### Finding 3 (Performance): Sequential Provider Fetching
-- **Severity**: Low-Medium
-- **Location**: [`src/providers.rs:919-940`](file:///home/spike/workspace/aitop/src/providers.rs#L919-L940) (`fetch_all`)
-- **Description**:
-  In `fetch_all`, providers are iterated sequentially:
-  ```rust
-  for name in &cfg.providers {
-      let mut p = match name.as_str() {
-          "codex" => codex(cfg, pricing),
-          "claude" => claude(cfg, pricing),
-          "copilot" => copilot(cfg, pricing),
-          "z.ai" | "zai" => zai(cfg, pricing),
-          "openrouter" => openrouter(cfg, pricing),
-          other => local_panel(...),
-      };
-      ...
-  }
+## Detailed Review of New Backend Subsystems
+
+### 1. Live z.ai Quota API Integration (`30bf571`)
+- **Discovery**: Reverse-engineered the endpoint used by `glm-plan-usage`:
+  ```http
+  GET https://api.z.ai/api/monitor/usage/quota/limit
+  Authorization: Bearer <ZAI_API_KEY>
   ```
-  If 4 or 5 providers are enabled, total latency equals the sum of all individual network roundtrips (often 1.5s–4.0s). In the TUI, pressing `r` (refresh) or waiting for an interval causes perceived lag.
-- **Recommendation**:
-  Fetch providers concurrently using scoped threads (`std::thread::scope` available in Rust 1.63+):
-  ```rust
-  let mut panels = Vec::new();
-  std::thread::scope(|s| {
-      let mut handles = Vec::new();
-      for name in &cfg.providers {
-          handles.push(s.spawn(|| fetch_provider(name, cfg, pricing)));
-      }
-      for h in handles {
-          if let Ok(p) = h.join() {
-              panels.push(p);
-          }
-      }
-  });
-  ```
+- **Implementation**:
+  - `quota_url(cfg)` extracts the host from `ZAI_BASE_URL`, supporting both `api.z.ai` and `open.bigmodel.cn`.
+  - `quota_limits()` and `add_quota_rows()` parse `CREDIT_LIMIT` and `TOKENS_LIMIT`:
+    - `unit: 3` -> 5h rolling window.
+    - `unit: 6` -> weekly window.
+    - `TIME_LIMIT` -> MCP / tool call quota.
+  - Automatically derives countdown timers from `nextResetTime` timestamps (`resets in 2h51m`, `resets in 2d02h`).
+- **Graceful Fallback**: If the quota API fails, `aitop` falls back to inspecting live `x-ratelimit-*` headers from `/models`, and then to local session token accounting against `ZAI_LIMIT_*`.
+
+### 2. True Generation Throughput Telemetry (`local.rs`)
+- In `pi` session logs, generation duration cannot be measured by simply taking timestamps between consecutive assistant messages (which would include tool execution time).
+- `aitop` indexes parent entries via `parentId`. Generation time is measured strictly between the trigger entry (`role: "user"` or `role: "toolResult"`) and the resulting assistant reply.
+- Computes both **24h rolling average tok/s** and **instantaneous last-request tok/s**, rendering per-model throughput metrics (`glm-5.3 · 56 tok/s`, `glm-5.2 · 54 tok/s`).
+
+### 3. Fixed-Column Proportional TUI Layout (`ui.rs`)
+- Standardized row rendering using fixed-width spans (`LABEL_W = 14`, `PCT_W = 5`, `BAR_W = 24`), ensuring progress bars, percentages, and reset countdowns align into uniform vertical columns across all providers.
 
 ---
 
-### Finding 4 (Terminal Safety): Raw Mode Restoration on Panic
-- **Severity**: Low-Medium
-- **Location**: [`src/main.rs:188-210`](file:///home/spike/workspace/aitop/src/main.rs#L188-L210)
-- **Description**:
-  Terminal setup executes:
-  ```rust
-  enable_raw_mode()?;
-  execute!(out, EnterAlternateScreen)?;
-  let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+## Verification & Test Results
 
-  let result = run_loop(&mut terminal, &mut state, &force, &rx);
+```
+running 54 tests
+test config::tests::env_helpers_fall_back_to_defaults ... ok
+test config::tests::gh_hosts_file_is_parsed ... ok
+test config::tests::codex_tokens_come_from_auth_json ... ok
+test local::tests::generation_time_comes_from_the_entry_that_triggered_the_call ... ok
+test local::tests::chained_assistant_replies_are_not_generation_time ... ok
+test local::tests::throughput_is_output_tokens_over_generation_time ... ok
+test providers::tests::live_quota_api_rows_replace_the_local_bars ... ok
+test providers::tests::quota_api_failure_falls_back_to_local_rows ... ok
+test providers::tests::local_panels_report_throughput_and_have_no_bars_without_a_cap ... ok
+test ui::tests::rows_use_fixed_columns_so_bars_line_up ... ok
+...
+test result: ok. 54 passed; 0 failed; 0 ignored; finished in 0.00s
+```
 
-  disable_raw_mode()?;
-  execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-  terminal.show_cursor()?;
-  ```
-  If `run_loop` or any internal rendering code panics (e.g. from a terminal geometry edge case or layout split assertion), standard unwind panics bypass the cleanup calls. The user's terminal is left in raw mode with cursor hidden and no echo.
-- **Recommendation**:
-  Install a custom panic hook or implement a cleanup guard:
-  ```rust
-  let original_hook = std::panic::take_hook();
-  std::panic::set_hook(Box::new(move |panic_info| {
-      let _ = crossterm::terminal::disable_raw_mode();
-      let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen, crossterm::cursor::Show);
-      original_hook(panic_info);
-  }));
-  ```
+- **Clippy**: `cargo clippy --all-targets -- --deny warnings` completed with 0 warnings.
+- **Formatting**: `cargo fmt --check` completed cleanly.
+- **Live Smoke Test**:
+  - `codex`: Live session extraction (36% 5h window, 24% 7d window, reset timers active).
+  - `z.ai`: Live quota API operational (1% 5h credit window, 4% weekly credit window, 32.9 mean tok/s).
+  - `openrouter`: Paid tier detected, credits balance ($3.58 of $30.00), pricing cache valid (469 models).
 
 ---
 
-### Finding 5 (Docs & Config): Claude Credentials vs `ANTHROPIC_API_KEY`
-- **Severity**: Low
-- **Location**: [`README.md:46`](file:///home/spike/workspace/aitop/README.md#L46) vs [`src/config.rs`](file:///home/spike/workspace/aitop/src/config.rs)
-- **Description**:
-  The README states:
-  > `CLAUDE_CREDENTIALS_FILE: path to ~/.claude/.credentials.json (or set ANTHROPIC_API_KEY)`  
-  > `GET https://api.anthropic.com/api/oauth/usage (OAuth refresh token from ~/.claude/.credentials.json, or an sk- key)`
-  
-  In the codebase:
-  1. `Config` has no `anthropic_api_key` field in `src/config.rs`.
-  2. `claude()` in `src/providers.rs` only attempts to read `cfg.claude_credentials_file`.
-  Anthropic's `api/oauth/usage` requires an OAuth Bearer token; standard `sk-ant-` API keys are rejected or not supported on this endpoint.
-- **Recommendation**:
-  Update `README.md` to clarify that live Claude utilization requires Claude Code's OAuth credentials (`~/.claude/.credentials.json`). If an `sk-` key is configured, fallback to displaying local session token totals (analogous to `local_panel`).
+## Conclusion & Recommended Next Step
 
----
-
-### Finding 6 (Build & Packaging): Embedded `CARGO_MANIFEST_DIR` in Config
-- **Severity**: Low
-- **Location**: [`src/config.rs:59`](file:///home/spike/workspace/aitop/src/config.rs#L59)
-- **Description**:
-  `dotenvy::from_filename(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env"))` embeds the absolute build machine path into the compiled binary as a last-resort `.env` lookup.
-  In a distributed release binary installed via `cargo install` or `install.sh`, this embeds the builder's local directory path.
-- **Recommendation**:
-  Only include `CARGO_MANIFEST_DIR` fallback under `#[cfg(debug_assertions)]`, or omit it in production builds.
-
----
-
-### Finding 7 (Scalability): Recursive Session Log Walking
-- **Severity**: Low
-- **Location**: [`src/local.rs:136-146`](file:///home/spike/workspace/aitop/src/local.rs#L136-L146) (`walk`)
-- **Description**:
-  `walk()` traverses all `.jsonl` files in `~/.pi/agent/sessions` and `~/.codex/sessions` and reads them into memory.
-  For active developers who accumulate thousands of session files over months, re-reading all files on every refresh tick could cause noticeable disk I/O and memory pressure.
-- **Recommendation**:
-  1. Filter files by `metadata.modified()` to only read files modified within the largest tracking window (7 days or 30 days).
-  2. Cache parsed session stats by file path and `mtime` so unmodified sessions are not re-parsed from disk repeatedly.
-
----
-
-## Action Plan & Roadmap
-
-### Priority 1: High-Impact Stability Fixes
-1. **Add HTTP Timeouts**: Add `.timeout(Duration::from_secs(8))` in `providers::request()` and `pricing::load()`.
-2. **Install Panic Hook**: Add terminal reset panic hook in `main.rs` to protect terminal state.
-3. **Correct OpenRouter Pacing**: Remove or adjust pacing on `daily/weekly/monthly` calendar spend rows in `openrouter_panel`.
-
-### Priority 2: Performance & Concurrency
-1. **Parallel Provider Fetching**: Use `std::thread::scope` in `fetch_all` to query network endpoints concurrently, reducing refresh latency.
-2. **Session Log Mtime Pruning**: Ignore `.jsonl` files with `mtime > 30 days` to maintain sub-10ms local accounting performance as session count grows.
-
-### Priority 3: Polish & Documentation
-1. **Align Claude Documentation**: Correct the `ANTHROPIC_API_KEY` reference in `README.md` and `.env.example`.
-2. **Remove Build Path**: Guard `CARGO_MANIFEST_DIR` fallback behind `#[cfg(debug_assertions)]`.
-
----
-
-## Conclusion
-
-`aitop` is a high-quality, practical Rust project that solves a genuine daily problem for developers working with multiple AI agents and providers. Its modular design, zero-bloat architecture, and deterministic test coverage make it exceptionally maintainable. Implementing the recommendations above will solidify its resilience in production environments and multi-provider setups.
+`aitop`'s data pipeline, quota discovery, and resilience are top-tier. Upgrading the TUI presentation layer with **responsive 2-column tiling**, a **focused Zoom / Detail mode**, and a **structured model table** will elevate the project from a capable terminal utility into a truly polished developer cockpit.

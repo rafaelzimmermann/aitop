@@ -28,7 +28,7 @@ use crate::pricing::Pricing;
 
 const HELP: &str = "aitop — htop for AI usage\n\n\
 usage: aitop [--json] [--plain] [--watch N] [--redact] [--history] [--help]\n\n\
-  TUI keys: q quit · r refresh now · h help · 1-9 focus provider · tab/↑/↓ cycle\n\n\
+  TUI keys: q quit · r refresh now · h help · 1-9 focus provider · tab cycle · Enter zoom · j/k scroll\n\n\
 providers:\n\
   codex      GET {CODEX_BASE_URL}/codex/usage (OAuth token from CODEX_AUTH_FILE)\n\
   claude     GET {ANTHROPIC_BASE_URL}/api/oauth/usage + local session logs\n\
@@ -162,6 +162,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             focus: 0,
             help: false,
             refresh_secs: cfg.refresh_secs,
+            scroll: 0,
+            zoom: false,
         };
         let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
         terminal.draw(|f| {
@@ -184,6 +186,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         focus: 0,
         help: false,
         refresh_secs: cfg.refresh_secs,
+        scroll: 0,
+        zoom: false,
     };
 
     let force = Arc::new(AtomicBool::new(false));
@@ -250,19 +254,43 @@ fn run_loop(
                 let count = state.snapshot.panels.len().max(1);
                 match k.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Esc => break,
+                    KeyCode::Esc => {
+                        if state.zoom {
+                            state.zoom = false;
+                            state.scroll = 0;
+                        } else {
+                            break;
+                        }
+                    }
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('r') => force.store(true, Ordering::Relaxed),
                     KeyCode::Char('h') => state.help = !state.help,
+                    KeyCode::Enter => {
+                        state.zoom = !state.zoom;
+                        state.scroll = 0;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if state.zoom {
+                            state.scroll = state.scroll.saturating_add(1)
+                        } else {
+                            state.focus = (state.focus + 1) % count
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if state.zoom {
+                            state.scroll = state.scroll.saturating_sub(1)
+                        } else {
+                            state.focus = (state.focus + count - 1) % count
+                        }
+                    }
+                    KeyCode::Tab => state.focus = (state.focus + 1) % count,
+                    KeyCode::BackTab => state.focus = (state.focus + count - 1) % count,
                     KeyCode::Char(c) if c.is_ascii_digit() => {
                         let i = (c as usize) - ('1' as usize);
                         if i < count {
                             state.focus = i;
+                            state.scroll = 0;
                         }
-                    }
-                    KeyCode::Tab | KeyCode::Down => state.focus = (state.focus + 1) % count,
-                    KeyCode::BackTab | KeyCode::Up => {
-                        state.focus = (state.focus + count - 1) % count
                     }
                     _ => {}
                 }

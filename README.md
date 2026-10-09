@@ -41,7 +41,7 @@ aitop --plain --history # sparkline over 7 daily buckets instead of 24 hourly on
 aitop --help
 ```
 
-TUI keys: `q` quit · `r` refresh now · `h` help · `1-9` focus provider · `Tab`/`↑`/`↓` cycle.
+TUI keys: `q` quit · `r` refresh now · `h` help · `Enter` zoom focused panel · `j`/`k` or `↑`/`↓` scroll when zoomed (cycle focus when not) · `Tab` cycle focus · `1-9` focus provider. On wide terminals (≥110 cols) panels tile into two columns.
 
 ## Data sources
 
