@@ -1100,6 +1100,135 @@ pub fn openrouter(cfg: &Config, pricing: &Pricing) -> Panel {
     openrouter_panel(cfg, pricing, d, credits.as_ref(), None)
 }
 
+// ---------------------------------------------------------------- DeepSeek
+
+/// DeepSeek sends its money as strings (`"total_balance": "10.00"`); tolerate real
+/// JSON numbers too so a future API change does not silently zero the row.
+fn amount(v: &Value) -> f64 {
+    match v.as_str() {
+        Some(s) => s
+            .replace(",", "")
+            .replace("$", "")
+            .trim()
+            .parse()
+            .unwrap_or(0.0),
+        None => v.as_f64().unwrap_or(0.0),
+    }
+}
+
+fn currency_symbol(cur: &str) -> String {
+    match cur {
+        "USD" => "$".to_string(),
+        "CNY" | "RMB" => "¥".to_string(),
+        "EUR" => "€".to_string(),
+        "GBP" => "£".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn deepseek_panel(
+    cfg: &Config,
+    data: Option<&Value>,
+    stats: &local::Stats,
+    err: Option<String>,
+) -> Panel {
+    let mut p = Panel::new("deepseek");
+    let live = data.is_some();
+    p.source = Some(if live {
+        "live balance API".into()
+    } else {
+        "local session logs".into()
+    });
+    p.subtitle = match &cfg.deepseek_key {
+        Some(k) => format!(
+            "key {} · {}",
+            mask_key(cfg, k),
+            if live {
+                "live balance"
+            } else {
+                "balance unavailable"
+            },
+        ),
+        None => format!("no key · {}", stats.requests),
+    };
+    if let Some(e) = err {
+        p.error = Some(e.clone());
+    }
+
+    if let Some(d) = data {
+        if d.get("is_available").and_then(|x| x.as_bool()) == Some(false) {
+            p.lines.push("⚠ account not available".to_string());
+        }
+        let infos: Vec<&Value> = d
+            .get("balance_infos")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
+        // DeepSeek can return several currencies; USD is the one the panel is labelled in
+        let entry = infos
+            .iter()
+            .find(|b| b.get("currency").and_then(|c| c.as_str()).unwrap_or("") == "USD")
+            .or_else(|| infos.first());
+        if let Some(b) = entry {
+            let cur = b.get("currency").and_then(|c| c.as_str()).unwrap_or("USD");
+            let sym = currency_symbol(cur);
+            let get = |key: &str| -> f64 { b.get(key).map(amount).unwrap_or(0.0) };
+            let (total, granted, topped_up) = (
+                get("total_balance"),
+                get("granted_balance"),
+                get("topped_up_balance"),
+            );
+            // a lifetime balance has no window to pace against; a bar only makes sense
+            // against a configured spending budget (OR_BUDGET_MONTH)
+            let budget = cfg.budget.month as f64;
+            let mut r = Row::new(
+                "balance",
+                if budget > 0.0 {
+                    (total / budget * 100.0).min(100.0)
+                } else {
+                    0.0
+                },
+                format!(
+                    "{sym}{total:.2} total ({sym}{topped_up:.2} topped-up · {sym}{granted:.2} granted)",
+                ),
+            );
+            if budget > 0.0 {
+                r.set_cap(&format!("{sym}{budget:.2}"));
+            }
+            p.rows.push(r);
+            if cur != "USD" {
+                p.lines.push(format!("balance reported in {cur}"));
+            }
+        } else {
+            p.lines
+                .push("balance API returned no balance_infos".to_string());
+        }
+    }
+
+    add_local_lines(&mut p, cfg, stats);
+    p
+}
+
+pub fn deepseek(cfg: &Config, pricing: &Pricing) -> Panel {
+    let stats = local::pi_usage(&cfg.pi_session_dir, "deepseek", pricing);
+    let key = match &cfg.deepseek_key {
+        Some(k) => k.clone(),
+        None => {
+            return deepseek_panel(
+                cfg,
+                None,
+                &stats,
+                Some("no key (set DEEPSEEK_API_KEY)".into()),
+            )
+        }
+    };
+    let url = format!("{}/user/balance", cfg.deepseek_base.trim_end_matches('/'));
+    match get_json(&url, Some(&key), &[]) {
+        Ok(v) => deepseek_panel(cfg, Some(&v), &stats, None),
+        Err(e) => deepseek_panel(cfg, None, &stats, Some(format!("{url} -> {e}"))),
+    }
+}
+
 // ---------------------------------------------------------------- all
 
 fn panel_cache_path(dir: &Path, name: &str) -> PathBuf {
@@ -1154,6 +1283,7 @@ fn fetch_provider(cfg: &Config, pricing: &Pricing, name: &str) -> Panel {
         "copilot" => copilot(cfg, pricing),
         "z.ai" | "zai" => zai(cfg, pricing),
         "openrouter" => openrouter(cfg, pricing),
+        "deepseek" => deepseek(cfg, pricing),
         other => local_panel(
             cfg,
             other,
@@ -1633,5 +1763,144 @@ mod tests {
         let z = zai_panel(&cfg, &stats, &[], None);
         assert_eq!(z.rows.len(), 4);
         assert!(z.lines.iter().any(|l| l.contains("output tok/s")));
+    }
+
+    #[test]
+    fn deepseek_balance_rows_come_from_the_live_api() {
+        let cfg = test_config();
+        let v: Value = serde_json::json!({
+            "is_available": true,
+            "balance_infos": [
+                {
+                    "currency": "USD",
+                    "total_balance": "10.00",
+                    "granted_balance": "0.00",
+                    "topped_up_balance": "10.00"
+                }
+            ]
+        });
+        let stats = local::Stats {
+            requests: 7,
+            requests_5h: 3,
+            ..Default::default()
+        };
+
+        let p = deepseek_panel(&cfg, Some(&v), &stats, None);
+        assert_eq!(p.name, "deepseek");
+        assert_eq!(p.source, Some("live balance API".to_string()));
+        assert_eq!(p.subtitle, "no key · 7");
+        assert!(p.error.is_none(), "a live payload is not an error panel");
+        assert_eq!(p.rows.len(), 1);
+        assert_eq!(p.rows[0].label, "balance");
+        assert_eq!(
+            p.rows[0].pct, 0.0,
+            "a lifetime balance has no bar without a budget"
+        );
+        assert!(p.rows[0].cap.is_none());
+        assert_eq!(
+            p.rows[0].detail,
+            "$10.00 total ($10.00 topped-up · $0.00 granted)".to_string(),
+        );
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "requests: 7 total · 3 in last 5h"));
+
+        // a key is masked in the subtitle, never shown in full
+        let mut c = cfg.clone();
+        c.deepseek_key = Some("3af1deadbeefdeadbeef".into());
+        assert_eq!(
+            deepseek_panel(&c, Some(&v), &stats, None).subtitle,
+            "key 3af1… · live balance",
+        );
+
+        // numeric amounts and a non-USD currency are tolerated
+        let numeric: Value = serde_json::json!({
+            "is_available": true,
+            "balance_infos": [
+                {
+                    "currency": "CNY",
+                    "total_balance": 12.5,
+                    "granted_balance": 2,
+                    "topped_up_balance": "10.5"
+                }
+            ]
+        });
+        let cn = deepseek_panel(&cfg, Some(&numeric), &local::Stats::default(), None);
+        assert_eq!(
+            cn.rows[0].detail,
+            "¥12.50 total (¥10.50 topped-up · ¥2.00 granted)".to_string()
+        );
+        assert!(cn.lines.iter().any(|l| l == "balance reported in CNY"));
+
+        // with a spending budget the balance gets a bar to pace against
+        let mut b = cfg.clone();
+        b.budget.month = 20;
+        let bp = deepseek_panel(&b, Some(&v), &local::Stats::default(), None);
+        assert_eq!(bp.rows[0].pct, 50.0);
+        assert_eq!(bp.rows[0].cap, Some("$20.00".to_string()));
+    }
+
+    #[test]
+    fn deepseek_without_a_key_falls_back_to_local_logs() {
+        let cfg = test_config();
+        let stats = local::Stats {
+            requests: 4,
+            cost_total: 0.25,
+            cost_24h: 0.1,
+            ..Default::default()
+        };
+        let p = deepseek_panel(
+            &cfg,
+            None,
+            &stats,
+            Some("no key (set DEEPSEEK_API_KEY)".into()),
+        );
+        assert_eq!(p.source, Some("local session logs".to_string()));
+        assert_eq!(p.subtitle, "no key · 4");
+        assert_eq!(p.error.as_deref(), Some("no key (set DEEPSEEK_API_KEY)"));
+        assert!(
+            p.rows.is_empty(),
+            "no balance row without a balance reading"
+        );
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "requests: 4 total · 0 in last 5h"));
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l.contains("est. cost: $0.25 total · $0.10 in 24h")));
+    }
+
+    #[test]
+    fn deepseek_unavailable_account_is_flagged() {
+        let cfg = test_config();
+        let v: Value = serde_json::json!({
+            "is_available": false,
+            "balance_infos": [
+                {
+                    "currency": "USD",
+                    "total_balance": "0.00",
+                    "granted_balance": "0.00",
+                    "topped_up_balance": "0.00"
+                }
+            ]
+        });
+        let p = deepseek_panel(&cfg, Some(&v), &local::Stats::default(), None);
+        assert!(p.lines.iter().any(|l| l == "⚠ account not available"));
+        assert_eq!(
+            p.rows[0].detail,
+            "$0.00 total ($0.00 topped-up · $0.00 granted)".to_string()
+        );
+
+        // an empty balance_infos array says so instead of inventing a zero row
+        let empty: Value = serde_json::json!({ "is_available": true, "balance_infos": [] });
+        let e = deepseek_panel(&cfg, Some(&empty), &local::Stats::default(), None);
+        assert!(e.rows.is_empty());
+        assert!(e
+            .lines
+            .iter()
+            .any(|l| l == "balance API returned no balance_infos"));
     }
 }

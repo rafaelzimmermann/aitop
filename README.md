@@ -52,6 +52,7 @@ TUI keys: `q` quit · `r` refresh now · `h` help · `Enter` zoom focused panel 
 | copilot    | `GET https://api.github.com/copilot_internal/user` (`GITHUB_TOKEN`, `gh` token, or `~/.config/gh/oauth_token`) |
 | z.ai       | live quota API `GET {host}/api/monitor/usage/quota/limit` (the endpoint the glm-plan-usage plugins use; same Bearer key as `ZAI_API_KEY`) → 5h/weekly quota rows with exact percentages and reset times; falls back to local accounting from `~/.pi/agent/sessions` compared against configurable `ZAI_LIMIT_*` when the endpoint is unavailable; plus a live `/models` probe that prints any `x-ratelimit-*` headers the gateway returns |
 | openrouter | `GET https://openrouter.ai/api/v1/key` and `/api/v1/credits`     |
+| deepseek   | `GET https://api.deepseek.com/user/balance` (`DEEPSEEK_API_KEY`) — the official account balance (lifetime, not a rolling quota) plus local session activity from `PI_SESSION_DIR` |
 | any other  | no quota API → local session logs (`PROVIDERS=ollama,strata`), reported as totals plus output tok/s (generation time measured from each assistant message to its parent) |
 
 Model pricing for the local accounting comes from `GET {OPENROUTER_BASE_URL}/models`,
@@ -85,13 +86,14 @@ Lookup order: `AITOP_ENV` → `./.env` → `~/.config/aitop/.env` → project `.
 | `ZAI_API_KEY` / `ZAI_BASE_URL` | z.ai key + `https://api.z.ai/api/coding/paas/v4` |
 | `ZAI_LIMIT_5H` / `ZAI_LIMIT_DAY` / `ZAI_LIMIT_WEEK` / `ZAI_LIMIT_RPM` | assumed caps for the local z.ai accounting — tune to your plan; usage above a cap is clamped to 100% and flagged as "over assumed cap", it is a wrong guess, not an exhausted quota |
 | `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` | OpenRouter key + base |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | DeepSeek key + default `https://api.deepseek.com` |
 | `OR_BUDGET_DAY` / `OR_BUDGET_WEEK` / `OR_BUDGET_MONTH` | optional daily/weekly/monthly spending budgets (USD); pace on OpenRouter calendar rows is computed against these, not against your lifetime balance |
 | `CODEX_SESSION_DIR` / `PI_SESSION_DIR` | local session-log directories used for the 24h sparkline and local accounting |
 | `AITOP_CACHE_DIR` | `~/.cache/aitop` — panel snapshots, pricing cache and `limits.json`, created 0700, files 0600 |
 | `PRICING_CACHE_HOURS` | pricing cache TTL (default 24) |
 | `PACE_TRIGGER` | pace ahead/behind threshold (default 10) |
 | `AITOP_REDACT` | `1` hides email + key prefixes (same as `--redact`) |
-| `PROVIDERS` | comma-separated panel list and order (default `codex,z.ai,openrouter`) |
+| `PROVIDERS` | comma-separated panel list and order (default `codex,deepseek,z.ai,openrouter`) |
 
 The Codex usage endpoint returns `403` without a `codex_cli_rs/*` User-Agent, so the client sends one.
 

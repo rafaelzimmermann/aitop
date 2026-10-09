@@ -35,6 +35,7 @@ providers:\n\
   copilot    GET {GITHUB_API_BASE_URL}/copilot_internal/user (GITHUB_TOKEN)\n\
   z.ai       no public quota API → local accounting from PI_SESSION_DIR vs ZAI_LIMIT_*\n\
   openrouter GET {OPENROUTER_BASE_URL}/key + /credits\n\
+  deepseek   GET {DEEPSEEK_BASE_URL}/user/balance (DEEPSEEK_API_KEY) + local session logs\n\
   other      no quota API → local session logs (totals + output tok/s)\n\n\
 --plain/--json print one snapshot; add --watch N to keep refreshing every N seconds\n--redact hides the account email and API key prefixes (useful when piping --json to a file)\n--history draws the sparkline over 7 daily buckets instead of 24 hourly ones\n";
 

@@ -40,6 +40,11 @@ pub struct Config {
     pub openrouter_key: Option<String>,
     pub openrouter_base: String,
 
+    /// DeepSeek's official balance endpoint reports a lifetime account balance, not a
+    /// rolling quota, so the panel shows the balance plus local session activity.
+    pub deepseek_key: Option<String>,
+    pub deepseek_base: String,
+
     pub codex_session_dir: PathBuf,
     pub pi_session_dir: PathBuf,
 
@@ -139,7 +144,14 @@ pub fn load() -> Config {
                 .filter(|p| !p.is_empty())
                 .collect()
         })
-        .unwrap_or_else(|| vec!["codex".into(), "z.ai".into(), "openrouter".into()]);
+        .unwrap_or_else(|| {
+            vec![
+                "codex".into(),
+                "deepseek".into(),
+                "z.ai".into(),
+                "openrouter".into(),
+            ]
+        });
 
     Config {
         refresh_secs: env_num("REFRESH_SECONDS", 5),
@@ -178,6 +190,9 @@ pub fn load() -> Config {
 
         openrouter_key: env_opt("OPENROUTER_API_KEY"),
         openrouter_base: env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+
+        deepseek_key: env_opt("DEEPSEEK_API_KEY"),
+        deepseek_base: env("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
 
         codex_session_dir: PathBuf::from(env(
             "CODEX_SESSION_DIR",
@@ -257,6 +272,8 @@ pub fn test_config() -> Config {
         zai_base: "https://api.z.ai/api/coding/paas/v4".into(),
         openrouter_key: None,
         openrouter_base: "https://openrouter.ai/api/v1".into(),
+        deepseek_key: None,
+        deepseek_base: "https://api.deepseek.com".into(),
         codex_session_dir: PathBuf::from("/tmp/aitop-test-home/.codex/sessions"),
         pi_session_dir: PathBuf::from("/tmp/aitop-test-home/.pi/agent/sessions"),
         zai_limits: Limits {
