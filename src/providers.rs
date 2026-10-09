@@ -253,10 +253,9 @@ fn add_local_lines(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
 
 // ---------------------------------------------------------------- Codex
 
-/// Cached refreshed token (we never rewrite codex's own auth.json).
+/// Cached access token from our own previous refresh attempt.
 fn cached_token(cfg: &Config) -> Option<String> {
-    let raw = std::fs::read_to_string(cfg.cache_dir.join("codex_token.json")).ok()?;
-    let v: Value = serde_json::from_str(&raw).ok()?;
+    let v = token_cache_file(cfg)?;
     let expires = v.get("expires_at").and_then(|x| x.as_i64()).unwrap_or(0);
     if expires <= Utc::now().timestamp() {
         return None;
@@ -266,8 +265,77 @@ fn cached_token(cfg: &Config) -> Option<String> {
         .map(str::to_string)
 }
 
-fn refresh_codex_token(cfg: &Config) -> Option<String> {
-    let rt = config::codex_refresh_token(cfg)?;
+/// The newest refresh token we hold. OpenAI refresh tokens are single-use: each
+/// successful grant rotates them and rejects the old one with
+/// `refresh_token_reused`, so the rotated copy must be persisted or every
+/// subsequent refresh (ours *and* the codex CLI's) bricks the login.
+fn cached_refresh_token(cfg: &Config) -> Option<String> {
+    token_cache_file_field(cfg, "refresh_token")
+}
+
+fn token_cache_file(cfg: &Config) -> Option<Value> {
+    let raw = std::fs::read_to_string(cfg.cache_dir.join("codex_token.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn token_cache_file_field(cfg: &Config, key: &str) -> Option<String> {
+    token_cache_file(cfg)?
+        .get(key)
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Trim an OAuth token response down to what we persist: access token, expiry,
+/// and — critically — the rotated refresh token. Dropping it is what turns every
+/// refresh into a one-way trip to `refresh_token_reused`.
+fn token_cache_payload(resp: &Value, now: i64) -> Option<Value> {
+    let access = resp.get("access_token").and_then(|x| x.as_str())?;
+    let ttl = resp
+        .get("expires_in")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(3600);
+    let mut out = serde_json::json!({ "access_token": access, "expires_at": now + ttl });
+    if let Some(rt) = resp.get("refresh_token").and_then(|x| x.as_str()) {
+        if !rt.is_empty() {
+            out["refresh_token"] = Value::String(rt.to_string());
+        }
+    }
+    Some(out)
+}
+
+/// Merge fresh tokens into codex's auth.json contents, preserving the fields we
+/// do not manage (`auth_mode`, `OPENAI_API_KEY`, `tokens.account_id`, ...). The
+/// grant we just ran consumed the refresh token previously stored there, so
+/// handing back the rotated replacement keeps the codex CLI working too.
+fn merged_auth_json(raw: &str, access: &str, refresh: Option<&str>, now: i64) -> Option<String> {
+    let mut v: Value = serde_json::from_str(raw).ok()?;
+    {
+        let tokens = v.get_mut("tokens")?.as_object_mut()?;
+        tokens.insert("access_token".into(), Value::String(access.to_string()));
+        if let Some(rt) = refresh {
+            if !rt.is_empty() {
+                tokens.insert("refresh_token".into(), Value::String(rt.to_string()));
+            }
+        }
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("last_refresh".into(), Value::String(rfc3339(now)));
+    }
+    serde_json::to_string_pretty(&v).ok()
+}
+
+fn rfc3339(now: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(now, 0)
+        .single()
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default()
+}
+
+/// One refresh grant against the OAuth token endpoint, returning the raw response.
+fn oauth_refresh(cfg: &Config, rt: &str) -> Result<Value, FetchErr> {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "client_id": cfg.codex_client_id,
@@ -276,17 +344,66 @@ fn refresh_codex_token(cfg: &Config) -> Option<String> {
         "refresh_token": rt,
     });
     let url = format!("{}/oauth/token", cfg.auth_base.trim_end_matches('/'));
-    let resp = request(&url, None, &[], Some(&body)).ok()?;
-    let v = resp.into_json::<Value>().ok()?;
-    let token = v.get("access_token").and_then(|x| x.as_str())?;
-    let ttl = v.get("expires_in").and_then(|x| x.as_i64()).unwrap_or(3600);
-    let out =
-        serde_json::json!({ "access_token": token, "expires_at": Utc::now().timestamp() + ttl });
-    if let Ok(raw) = serde_json::to_string(&out) {
-        util::secret_dir(&cfg.cache_dir);
-        util::write_secret(&cfg.cache_dir.join("codex_token.json"), &raw);
+    let resp = request(&url, None, &[], Some(&body))?;
+    resp.into_json::<Value>().map_err(|e| FetchErr {
+        status: None,
+        text: e.to_string(),
+    })
+}
+
+/// Exchange a refresh token for a fresh access token. Tries our own rotated copy
+/// first (it may be newer than what codex has on disk), then the one from
+/// auth.json (which may have been rotated by the codex CLI since we last ran).
+/// On success the rotated refresh token is persisted to both our cache and
+/// codex's auth.json so the two stay on the same token chain.
+fn refresh_codex_token(cfg: &Config) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(rt) = cached_refresh_token(cfg) {
+        candidates.push(rt);
     }
-    Some(token.to_string())
+    if let Some(rt) = config::codex_refresh_token(cfg) {
+        if !candidates.contains(&rt) {
+            candidates.push(rt);
+        }
+    }
+    for rt in &candidates {
+        let Ok(resp) = oauth_refresh(cfg, rt) else {
+            continue;
+        };
+        let Some(payload) = token_cache_payload(&resp, Utc::now().timestamp()) else {
+            continue;
+        };
+        let Some(access) = payload
+            .get("access_token")
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let rotated = payload
+            .get("refresh_token")
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        if let Ok(raw) = serde_json::to_string(&payload) {
+            util::secret_dir(&cfg.cache_dir);
+            util::write_secret(&cfg.cache_dir.join("codex_token.json"), &raw);
+        }
+        if let Ok(raw) = std::fs::read_to_string(&cfg.codex_auth_file) {
+            if let Some(out) =
+                merged_auth_json(&raw, &access, rotated.as_deref(), Utc::now().timestamp())
+            {
+                // Write via temp file + rename so a concurrent codex CLI reader
+                // never sees a half-written auth.json.
+                let tmp = cfg.codex_auth_file.with_extension("json.aitop-tmp");
+                util::write_secret(&tmp, &out);
+                if std::fs::rename(&tmp, &cfg.codex_auth_file).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        }
+        return Some(access);
+    }
+    None
 }
 
 fn codex_panel(cfg: &Config, pricing: &Pricing, v: &Value) -> Panel {
@@ -452,8 +569,13 @@ pub fn codex(cfg: &Config, pricing: &Pricing) -> Panel {
                         return codex_panel(cfg, pricing, &v);
                     }
                 }
+                p.error = Some(
+                    "codex token expired (HTTP 401) and refresh failed — run `codex login` to re-authenticate"
+                        .into(),
+                );
+            } else {
+                p.error = Some(format!("{url} -> {e}"));
             }
-            p.error = Some(format!("{url} -> {e}"));
             p
         }
     }
@@ -1811,6 +1933,64 @@ mod tests {
             },
         );
         p
+    }
+
+    #[test]
+    fn refresh_cache_keeps_rotated_refresh_token() {
+        let resp = serde_json::json!({
+            "access_token": "fresh-access",
+            "refresh_token": "rotated-refresh",
+            "id_token": "dropped",
+            "expires_in": 3600
+        });
+        let v = token_cache_payload(&resp, 1000).expect("payload");
+        assert_eq!(v["access_token"], "fresh-access");
+        // The rotated refresh token must survive: it is single-use and the only
+        // key to the next refresh.
+        assert_eq!(v["refresh_token"], "rotated-refresh");
+        assert_eq!(v["expires_at"], 4600);
+        assert!(v.get("id_token").is_none());
+    }
+
+    #[test]
+    fn refresh_cache_without_rotated_token_omits_field() {
+        let resp = serde_json::json!({ "access_token": "a", "expires_in": 60 });
+        let v = token_cache_payload(&resp, 0).expect("payload");
+        assert!(v.get("refresh_token").is_none());
+    }
+
+    #[test]
+    fn auth_json_merge_preserves_unmanaged_fields() {
+        let raw = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "account_id": "acc-123"
+            },
+            "last_refresh": "2020-01-01T00:00:00Z"
+        })
+        .to_string();
+        let out = merged_auth_json(&raw, "new-access", Some("new-refresh"), 1000).expect("merged");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["auth_mode"], "chatgpt");
+        assert_eq!(v["tokens"]["account_id"], "acc-123");
+        assert_eq!(v["tokens"]["access_token"], "new-access");
+        assert_eq!(v["tokens"]["refresh_token"], "new-refresh");
+        assert_ne!(v["last_refresh"], "2020-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn auth_json_merge_without_refresh_keeps_existing_token() {
+        let raw = serde_json::json!({
+            "tokens": { "access_token": "old-access", "refresh_token": "keep-me" }
+        })
+        .to_string();
+        let out = merged_auth_json(&raw, "new-access", None, 0).expect("merged");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tokens"]["access_token"], "new-access");
+        assert_eq!(v["tokens"]["refresh_token"], "keep-me");
     }
 
     #[test]
