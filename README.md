@@ -10,6 +10,10 @@
 - Zoom into a provider or use the two-column overview on terminals at least 110 columns wide.
 - Distinguish live provider data, local estimates, and stale cached snapshots in panel titles.
 
+![aitop dashboard showing Codex, z.ai, DeepSeek, and OpenRouter panels with account email and key fragments redacted](docs/images/aitop-redacted.png)
+
+*Dashboard screenshot edited to redact account email and key fragments.*
+
 ## Install
 
 Build from source with a current stable [Rust toolchain](https://www.rust-lang.org/tools/install) and Git:
