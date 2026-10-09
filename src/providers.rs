@@ -98,6 +98,25 @@ fn num(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_f64())
 }
 
+/// Local engines are probed on every refresh tick; an offline server must not stall
+/// the loop, so these probes get a tighter bound than remote providers.
+const LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn get_local_json(url: &str) -> Result<Value, FetchErr> {
+    let req = ureq::get(url)
+        .timeout(LOCAL_TIMEOUT)
+        .set("User-Agent", UA)
+        .set("accept", "application/json");
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(e) => return Err(FetchErr::from(e)),
+    };
+    resp.into_json::<Value>().map_err(|e| FetchErr {
+        status: None,
+        text: e.to_string(),
+    })
+}
+
 fn add_row(p: &mut Panel, cfg: &Config, mut r: Row, window_secs: u64, reset_after: u64) {
     if let Some(pa) = pace::assess(window_secs, reset_after, r.pct, cfg.pace_trigger) {
         r.pace = Some(pace::label(&pa));
@@ -1229,6 +1248,181 @@ pub fn deepseek(cfg: &Config, pricing: &Pricing) -> Panel {
     }
 }
 
+// ---------------------------------------------------------------- Strata (local engine)
+
+/// Context windows are conventionally rounded to thousands ("128k").
+fn fmt_ctx(n: u64) -> String {
+    if n >= 1000 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
+    }
+}
+
+fn strata_panel(
+    cfg: &Config,
+    status: Option<&Value>,
+    models: Option<&Value>,
+    stats: &local::Stats,
+    err: Option<String>,
+) -> Panel {
+    let mut p = Panel::new("strata");
+    let live = status.is_some() || models.is_some();
+    if live {
+        p.source = Some("live engine API".into());
+
+        let first = models
+            .and_then(|m| m.get("data").and_then(|d| d.as_array()))
+            .and_then(|a| a.first());
+        let model_id = first.and_then(|m| m.get("id").and_then(|x| x.as_str()));
+        let n_ctx = first
+            .and_then(|m| {
+                m.get("meta")
+                    .and_then(|mt| mt.get("n_ctx"))
+                    .or_else(|| m.get("context_length"))
+            })
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0) as u64;
+
+        let busy = status
+            .and_then(|s| s.get("busy").and_then(|x| x.as_bool()))
+            .unwrap_or(false);
+        let phase = status
+            .and_then(|s| s.get("phase").and_then(|x| x.as_str()))
+            .unwrap_or("unknown");
+        let status_str = if busy {
+            format!("busy ({phase})")
+        } else {
+            "idle".to_string()
+        };
+        let ctx_label = if n_ctx > 0 {
+            fmt_ctx(n_ctx)
+        } else {
+            "".to_string()
+        };
+        p.subtitle = match model_id {
+            Some(id) if n_ctx > 0 => format!("{id} · {ctx_label} ctx · {status_str}"),
+            Some(id) => format!("{id} · {status_str}"),
+            None => format!("no model loaded · {status_str}"),
+        };
+
+        let prompt_tokens = status
+            .and_then(|s| s.get("prompt_tokens").and_then(|x| x.as_f64()))
+            .unwrap_or(0.0) as u64;
+        if n_ctx > 0 && prompt_tokens > 0 {
+            let pct = (prompt_tokens as f64 / n_ctx as f64 * 100.0).min(100.0);
+            let mut r = Row::new(
+                "context",
+                pct,
+                format!("{} / {} ({:.1}%)", prompt_tokens, n_ctx, pct),
+            );
+            r.set_cap(&fmt_tokens(n_ctx));
+            p.rows.push(r);
+        }
+
+        if busy {
+            let generated = status
+                .and_then(|s| s.get("generated").and_then(|x| x.as_f64()))
+                .unwrap_or(0.0) as u64;
+            let max_tokens = status
+                .and_then(|s| s.get("max_tokens").and_then(|x| x.as_f64()))
+                .unwrap_or(0.0) as u64;
+            p.lines.push(format!(
+                "⚡ generating: {generated}/{max_tokens} tokens ({phase})"
+            ));
+        }
+        let queued = status
+            .and_then(|s| s.get("queued").and_then(|x| x.as_f64()))
+            .unwrap_or(0.0) as u64;
+        if queued > 0 {
+            p.lines.push(format!("queued requests: {queued}"));
+        }
+    } else {
+        p.source = Some("local session logs".into());
+        p.subtitle = format!("offline · {}", stats.requests);
+        p.error = err;
+        add_local_rows(&mut p, cfg, stats, &Limits::default());
+    }
+    add_local_lines(&mut p, cfg, stats);
+    p
+}
+
+pub fn strata(cfg: &Config, pricing: &Pricing) -> Panel {
+    let stats = local::pi_usage(&cfg.pi_session_dir, "strata", pricing);
+    let base = cfg.strata_base.trim_end_matches('/');
+    let status = get_local_json(&format!("{base}/status"));
+    let models = get_local_json(&format!("{base}/v1/models"));
+    let err = match (&status, &models) {
+        (Err(e), Err(_)) => Some(format!("{base}/status -> {e}")),
+        (_, _) => None,
+    };
+    let status = status.ok();
+    let models = models.ok();
+    strata_panel(cfg, status.as_ref(), models.as_ref(), &stats, err)
+}
+
+// ---------------------------------------------------------------- Ollama (local engine)
+
+/// VRAM footprints read better in MiB below a gigabyte than as huge byte counts.
+fn fmt_vram(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB VRAM", bytes as f64 / GIB as f64)
+    } else {
+        format!("{} MiB VRAM", bytes / MIB)
+    }
+}
+
+fn ollama_panel(
+    cfg: &Config,
+    ps: Option<&Value>,
+    stats: &local::Stats,
+    err: Option<String>,
+) -> Panel {
+    let mut p = Panel::new("ollama");
+    if ps.is_some() {
+        p.source = Some("live engine API".into());
+        let loaded: Vec<&Value> = ps
+            .and_then(|v| v.get("models").and_then(|m| m.as_array()))
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
+        if loaded.is_empty() {
+            p.subtitle = "idle · no models in VRAM".to_string();
+        } else {
+            p.subtitle = format!("{} model(s) loaded · live engine", loaded.len());
+            for m in loaded {
+                let name = m.get("name").and_then(|x| x.as_str()).unwrap_or("unknown");
+                let vram =
+                    fmt_vram(m.get("size_vram").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64);
+                let quant = m
+                    .get("details")
+                    .and_then(|d| d.get("quantization_level"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown");
+                p.lines.push(format!("loaded: {name} ({vram}, {quant})"));
+            }
+        }
+    } else {
+        p.source = Some("local session logs".into());
+        p.subtitle = format!("offline · {}", stats.requests);
+        p.error = err;
+    }
+    add_local_rows(&mut p, cfg, stats, &Limits::default());
+    add_local_lines(&mut p, cfg, stats);
+    p
+}
+
+pub fn ollama(cfg: &Config, pricing: &Pricing) -> Panel {
+    let stats = local::pi_usage(&cfg.pi_session_dir, "ollama", pricing);
+    let url = format!("{}/api/ps", cfg.ollama_base.trim_end_matches('/'));
+    match get_local_json(&url) {
+        Ok(v) => ollama_panel(cfg, Some(&v), &stats, None),
+        Err(e) => ollama_panel(cfg, None, &stats, Some(format!("{url} -> {e}"))),
+    }
+}
+
 // ---------------------------------------------------------------- all
 
 fn panel_cache_path(dir: &Path, name: &str) -> PathBuf {
@@ -1284,6 +1478,8 @@ fn fetch_provider(cfg: &Config, pricing: &Pricing, name: &str) -> Panel {
         "z.ai" | "zai" => zai(cfg, pricing),
         "openrouter" => openrouter(cfg, pricing),
         "deepseek" => deepseek(cfg, pricing),
+        "strata" => strata(cfg, pricing),
+        "ollama" => ollama(cfg, pricing),
         other => local_panel(
             cfg,
             other,
@@ -1902,5 +2098,169 @@ mod tests {
             .lines
             .iter()
             .any(|l| l == "balance API returned no balance_infos"));
+    }
+
+    #[test]
+    fn strata_live_engine_shows_model_context_window_and_local_stats() {
+        let cfg = test_config();
+        let now = Utc::now();
+        let stats = local::Stats {
+            requests: 3,
+            requests_5h: 2,
+            first_5h: Some(now - chrono::Duration::hours(1)),
+            first_24h: Some(now - chrono::Duration::hours(2)),
+            first_7d: Some(now - chrono::Duration::days(1)),
+            ..Default::default()
+        };
+        let status: Value = serde_json::json!({
+            "busy": false, "queued": 0, "phase": "",
+            "prompt_tokens": 4096, "generated": 0, "max_tokens": 0
+        });
+        let models: Value = serde_json::json!({ "data": [
+            { "id": "qwen3.8-flash-next-coder-iq1_m",
+              "status": { "value": "ready" },
+              "meta": { "n_ctx": 128000 } }
+        ]});
+
+        let p = strata_panel(&cfg, Some(&status), Some(&models), &stats, None);
+        assert_eq!(p.name, "strata");
+        assert_eq!(p.source, Some("live engine API".to_string()));
+        assert_eq!(
+            p.subtitle,
+            "qwen3.8-flash-next-coder-iq1_m · 128k ctx · idle".to_string()
+        );
+        assert_eq!(p.rows.len(), 1);
+        assert_eq!(p.rows[0].label, "context");
+        assert_eq!(p.rows[0].pct, 3.2); // 4096 of 128000
+        assert_eq!(p.rows[0].cap.as_deref(), Some("128.0k"));
+        assert_eq!(p.rows[0].detail, "4096 / 128000 (3.2%)".to_string());
+        assert!(p.error.is_none());
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "requests: 3 total · 2 in last 5h"));
+
+        // a live status alone is enough to keep the panel off the offline path
+        let idle_no_model = strata_panel(&cfg, Some(&status), None, &stats, None);
+        assert_eq!(idle_no_model.subtitle, "no model loaded · idle".to_string());
+        assert!(idle_no_model.rows.is_empty(), "no n_ctx → no context bar");
+
+        // context_length directly on the entry is tolerated too
+        let flat: Value = serde_json::json!({ "data": [
+            { "id": "llama", "context_length": 8192 }
+        ]});
+        let fp = strata_panel(&cfg, Some(&status), Some(&flat), &stats, None);
+        assert_eq!(fp.subtitle, "llama · 8k ctx · idle".to_string());
+        assert_eq!(fp.rows[0].cap.as_deref(), Some("8.2k"));
+    }
+
+    #[test]
+    fn strata_busy_state_shows_generation_and_queue() {
+        let cfg = test_config();
+        let status: Value = serde_json::json!({
+            "busy": true, "queued": 2, "phase": "decoding",
+            "prompt_tokens": 1000, "generated": 512, "max_tokens": 4096
+        });
+        let p = strata_panel(&cfg, Some(&status), None, &local::Stats::default(), None);
+        assert!(p.subtitle.starts_with("no model loaded · busy (decoding)"));
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "⚡ generating: 512/4096 tokens (decoding)"));
+        assert!(p.lines.iter().any(|l| l == "queued requests: 2"));
+    }
+
+    #[test]
+    fn strata_offline_falls_back_to_local_logs() {
+        let cfg = test_config();
+        let stats = local::Stats {
+            requests: 5,
+            tokens_24h: 12_000,
+            ..Default::default()
+        };
+        let p = strata_panel(
+            &cfg,
+            None,
+            None,
+            &stats,
+            Some("http://127.0.0.1:8081/status -> connection refused".into()),
+        );
+        assert_eq!(p.source, Some("local session logs".to_string()));
+        assert_eq!(p.subtitle, "offline · 5".to_string());
+        assert_eq!(
+            p.error.as_deref(),
+            Some("http://127.0.0.1:8081/status -> connection refused"),
+        );
+        assert_eq!(p.rows.len(), 4);
+        assert!(p.rows.iter().all(|r| r.cap.is_none()));
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "requests: 5 total · 0 in last 5h"));
+    }
+
+    #[test]
+    fn ollama_live_engine_lists_loaded_models_with_vram() {
+        let cfg = test_config();
+        // 5.2 GiB = 5583457484.8 bytes; round up to a whole byte
+        let ps: Value = serde_json::json!({ "models": [
+            { "name": "gemma4:26b", "model": "gemma4",
+              "size_vram": 5583457485i64,
+              "details": { "quantization_level": "Q4_K_M" } }
+        ]});
+        let p = ollama_panel(&cfg, Some(&ps), &local::Stats::default(), None);
+        assert_eq!(p.name, "ollama");
+        assert_eq!(p.source, Some("live engine API".to_string()));
+        assert_eq!(p.subtitle, "1 model(s) loaded · live engine".to_string());
+        assert!(p.error.is_none());
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "loaded: gemma4:26b (5.2 GiB VRAM, Q4_K_M)"));
+
+        // sub-gigabyte footprints render in MiB
+        let small: Value = serde_json::json!({ "models": [
+            { "name": "tiny", "size_vram": 700 * 1024 * 1024,
+              "details": { "quantization_level": "Q8_0" } }
+        ]});
+        let sp = ollama_panel(&cfg, Some(&small), &local::Stats::default(), None);
+        assert!(sp
+            .lines
+            .iter()
+            .any(|l| l == "loaded: tiny (700 MiB VRAM, Q8_0)"));
+
+        // server up but nothing resident in VRAM
+        let none: Value = serde_json::json!({ "models": [] });
+        let np = ollama_panel(&cfg, Some(&none), &local::Stats::default(), None);
+        assert_eq!(np.subtitle, "idle · no models in VRAM".to_string());
+        assert!(np.lines.iter().any(|l| l.starts_with("requests: 0")));
+    }
+
+    #[test]
+    fn ollama_offline_falls_back_to_local_logs() {
+        let cfg = test_config();
+        let stats = local::Stats {
+            requests: 9,
+            requests_5h: 4,
+            ..Default::default()
+        };
+        let p = ollama_panel(
+            &cfg,
+            None,
+            &stats,
+            Some("http://127.0.0.1:11434/api/ps -> connection refused".into()),
+        );
+        assert_eq!(p.source, Some("local session logs".to_string()));
+        assert_eq!(p.subtitle, "offline · 9".to_string());
+        assert_eq!(
+            p.error.as_deref(),
+            Some("http://127.0.0.1:11434/api/ps -> connection refused"),
+        );
+        assert_eq!(p.rows.len(), 4);
+        assert!(p.rows.iter().all(|r| r.cap.is_none()));
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "requests: 9 total · 4 in last 5h"));
     }
 }

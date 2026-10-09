@@ -45,6 +45,10 @@ pub struct Config {
     pub deepseek_key: Option<String>,
     pub deepseek_base: String,
 
+    /// local inference engines probed on every refresh tick
+    pub strata_base: String,
+    pub ollama_base: String,
+
     pub codex_session_dir: PathBuf,
     pub pi_session_dir: PathBuf,
 
@@ -194,6 +198,9 @@ pub fn load() -> Config {
         deepseek_key: env_opt("DEEPSEEK_API_KEY"),
         deepseek_base: env("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
 
+        strata_base: env("STRATA_BASE_URL", "http://127.0.0.1:8081"),
+        ollama_base: env("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+
         codex_session_dir: PathBuf::from(env(
             "CODEX_SESSION_DIR",
             &h.join(".codex/sessions").display().to_string(),
@@ -274,6 +281,8 @@ pub fn test_config() -> Config {
         openrouter_base: "https://openrouter.ai/api/v1".into(),
         deepseek_key: None,
         deepseek_base: "https://api.deepseek.com".into(),
+        strata_base: "http://127.0.0.1:8081".into(),
+        ollama_base: "http://127.0.0.1:11434".into(),
         codex_session_dir: PathBuf::from("/tmp/aitop-test-home/.codex/sessions"),
         pi_session_dir: PathBuf::from("/tmp/aitop-test-home/.pi/agent/sessions"),
         zai_limits: Limits {
