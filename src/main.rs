@@ -156,7 +156,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if has_flag(&args, "--render-test") {
-        let snap = providers::fetch_all(&cfg, &pricing);
+        let (w, h) = if let Some(i) = args.iter().position(|a| a == "--size") {
+            let rest = args.get(i + 1).cloned().unwrap_or_default();
+            if let Some(sep) = rest.find('x') {
+                (
+                    rest[..sep].parse().unwrap_or(100),
+                    rest[sep + 1..].parse().unwrap_or(30),
+                )
+            } else {
+                (100, 30)
+            }
+        } else {
+            (100, 30)
+        };
+        let snap = if args.iter().any(|a| a == "--synthetic") {
+            let mk = |name: &str, rows: usize, lines: usize| {
+                let mut p = model::Panel::new(name);
+                p.subtitle = "synthetic panel".to_string();
+                for i in 0..rows {
+                    p.rows.push(model::Row::new(
+                        &format!("row{i}"),
+                        42.0,
+                        "1.2k/50k".to_string(),
+                    ));
+                }
+                for i in 0..lines {
+                    p.lines.push(format!("detail line {i}"));
+                }
+                p
+            };
+            Snapshot {
+                fetched_at: "2026-10-09T13:00:16.675005046+00:00".to_string(),
+                panels: vec![mk("alpha", 2, 3), mk("beta", 1, 2), mk("gamma", 2, 3)],
+            }
+        } else {
+            providers::fetch_all(&cfg, &pricing)
+        };
         let state = ui::State {
             snapshot: snap,
             focus: 0,
@@ -165,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scroll: 0,
             zoom: false,
         };
-        let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
+        let mut terminal = Terminal::new(TestBackend::new(w, h))?;
         terminal.draw(|f| {
             ui::draw(f, &state);
             let area = f.area();

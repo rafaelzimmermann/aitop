@@ -301,9 +301,10 @@ pub fn draw(f: &mut Frame, s: &State) {
             .split(chunks[1]);
         let n = s.snapshot.panels.len();
         let left_n = n.div_ceil(2);
+        // uniform height across both columns so their bottom edges align;
+        // the taller column defines the row height, leftover rows stay blank
+        let per = (cols[0].height / left_n as u16).max(3);
         for (col, lo, hi) in [(0, 0, left_n), (1, left_n, n)] {
-            let count = (hi - lo).max(1) as u16;
-            let per = (cols[col].height / count).max(3);
             for (j, i) in (lo..hi).enumerate() {
                 let p = &s.snapshot.panels[i];
                 let area = Rect {
