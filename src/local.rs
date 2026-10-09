@@ -151,7 +151,7 @@ pub fn collect(events: &[Event]) -> Stats {
     s.spark = buckets;
     s.daily = daily;
     s.models = models.into_values().collect();
-    s.models.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+    s.models.sort_by_key(|a| std::cmp::Reverse(a.tokens));
     s
 }
 
