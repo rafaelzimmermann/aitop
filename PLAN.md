@@ -3,6 +3,7 @@
 State at this commit: crate compiles, `cargo fmt --check` and
 `cargo clippy --all-targets -- --deny warnings` are clean, `cargo test` reports
 35 passing tests (config, local, model, pace, pricing, providers, ui, util, main).
+Now 41 with the history and `--history` tests.
 Smoke-tested against live endpoints with `--plain`, `--plain --redact` and `--json`.
 
 ## 1. Test pass — done
