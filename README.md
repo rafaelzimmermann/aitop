@@ -83,7 +83,7 @@ Lookup order: `AITOP_ENV` → `./.env` → `~/.config/aitop/.env` → project `.
 | `GITHUB_TOKEN` | copilot token; falls back to `gh`'s stored token |
 | `GITHUB_API_BASE_URL` | default `https://api.github.com` |
 | `ZAI_API_KEY` / `ZAI_BASE_URL` | z.ai key + `https://api.z.ai/api/coding/paas/v4` |
-| `ZAI_LIMIT_5H` / `ZAI_LIMIT_DAY` / `ZAI_LIMIT_WEEK` / `ZAI_LIMIT_RPM` | assumed caps for the local z.ai accounting — tune to your plan |
+| `ZAI_LIMIT_5H` / `ZAI_LIMIT_DAY` / `ZAI_LIMIT_WEEK` / `ZAI_LIMIT_RPM` | assumed caps for the local z.ai accounting — tune to your plan; usage above a cap is clamped to 100% and flagged as "over assumed cap", it is a wrong guess, not an exhausted quota |
 | `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` | OpenRouter key + base |
 | `OR_BUDGET_DAY` / `OR_BUDGET_WEEK` / `OR_BUDGET_MONTH` | optional daily/weekly/monthly spending budgets (USD); pace on OpenRouter calendar rows is computed against these, not against your lifetime balance |
 | `CODEX_SESSION_DIR` / `PI_SESSION_DIR` | local session-log directories used for the 24h sparkline and local accounting |

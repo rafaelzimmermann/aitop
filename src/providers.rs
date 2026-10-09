@@ -127,6 +127,11 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats, l: &Limits)
                 pct(used, limit),
                 format!("{} / {}", fmt_tokens(used), fmt_tokens(limit)),
             );
+            // a percentage above 100 is a misconfigured cap, not a quota reading:
+            // clamp it so the display never shows e.g. "600%"
+            if r.pct > 100.0 {
+                r.pct = 100.0;
+            }
             if limit > 0 {
                 r.set_cap(&fmt_tokens(limit));
             }
@@ -712,6 +717,27 @@ fn zai_panel(cfg: &Config, stats: &local::Stats, probe_lines: &[String]) -> Pane
         },
     };
     add_local_rows(&mut p, cfg, stats, &caps);
+    // usage above an assumed cap almost always means the cap guess is wrong, not that
+    // the plan is exhausted; say so instead of showing a 600% bar
+    let over = [
+        ("5h", stats.tokens_5h, caps.five_hour),
+        ("daily", stats.tokens_24h, caps.day),
+        ("weekly", stats.tokens_7d, caps.week),
+    ]
+    .iter()
+    .filter(|(_, used, cap)| *cap > 0 && *used > *cap)
+    .map(|(w, used, cap)| {
+        format!(
+            "over assumed cap in {} ({} > {}) — tune ZAI_LIMIT_* to your plan",
+            w,
+            fmt_tokens(*used),
+            fmt_tokens(*cap),
+        )
+    })
+    .collect::<Vec<String>>();
+    if !over.is_empty() {
+        p.lines.push(over.join(" · "));
+    }
     for l in probe_lines {
         p.lines.push(l.clone());
     }
@@ -1284,6 +1310,24 @@ mod tests {
         let p = zai_panel(&cfg, &s, &["x-ratelimit-limit: 60".to_string()]);
         assert_eq!(p.rows[3].detail, "12.0 / 60");
         assert_eq!(p.rows[1].cap, Some(fmt_tokens(cfg.zai_limits.day)));
+    }
+
+    #[test]
+    fn usage_over_an_assumed_cap_is_clamped_and_explained() {
+        let cfg = test_config();
+        let s = local::Stats {
+            tokens_5h: 80_000,
+            tokens_24h: 200_000,
+            tokens_7d: 6_000_000,
+            ..Default::default()
+        };
+        // 6M of a 5M weekly cap must not render as 600%
+        let p = zai_panel(&cfg, &s, &[]);
+        assert_eq!(p.rows[2].pct, 100.0);
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l.contains("over assumed cap in weekly (6.00M > 5.00M)")));
     }
 
     #[test]
