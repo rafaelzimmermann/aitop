@@ -1,6 +1,6 @@
+use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use chrono::{DateTime, Duration, Utc};
 
 use crate::pricing::Pricing;
 
@@ -72,7 +72,11 @@ fn collect(events: &[Event]) -> Stats {
             newest = Some(e.ts);
         }
 
-        let key = if e.model.is_empty() { "unknown".to_string() } else { e.model.clone() };
+        let key = if e.model.is_empty() {
+            "unknown".to_string()
+        } else {
+            e.model.clone()
+        };
         let m = models.entry(key).or_default();
         m.requests += 1;
         m.tokens += e.tokens;
@@ -129,20 +133,41 @@ pub fn pi_events(raw: &str, provider: &str, pricing: &Pricing) -> Vec<Event> {
             None => continue,
         };
         let num = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-        let (input, output, cr, cw) = (num("input"), num("output"), num("cacheRead"), num("cacheWrite"));
-        let tokens = usage.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(input + output);
+        let (input, output, cr, cw) = (
+            num("input"),
+            num("output"),
+            num("cacheRead"),
+            num("cacheWrite"),
+        );
+        let tokens = usage
+            .get("totalTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(input + output);
         if tokens == 0 {
             continue;
         }
-        let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
-        let logged = usage.get("cost").and_then(|c| c.get("total")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let model = msg
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
+        let logged = usage
+            .get("cost")
+            .and_then(|c| c.get("total"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let cost = if logged > 0.0 {
             logged
         } else {
             pricing.cost(provider, &model, input, output, cr, cw)
         };
         if let Some(t) = ts(&d) {
-            out.push(Event { ts: t, tokens, cost, model });
+            out.push(Event {
+                ts: t,
+                tokens,
+                cost,
+                model,
+            });
         }
     }
     out
@@ -176,17 +201,26 @@ pub fn codex_events(raw: &str, pricing: &Pricing) -> Vec<Event> {
         if ptype != Some("token_count") {
             continue;
         }
-        let info = payload.and_then(|p| p.get("info")).or_else(|| d.get("info"));
+        let info = payload
+            .and_then(|p| p.get("info"))
+            .or_else(|| d.get("info"));
         let last = match info.and_then(|i| i.get("last_token_usage")) {
             Some(l) => l,
             None => continue,
         };
         let num = |k: &str| last.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-        let tokens = last.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tokens = last
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         if tokens == 0 {
             continue;
         }
-        let model = info.and_then(|i| i.get("model")).and_then(|m| m.as_str()).unwrap_or("").to_string();
+        let model = info
+            .and_then(|i| i.get("model"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
         let cost = pricing.cost(
             "openai",
             &model,
@@ -196,7 +230,12 @@ pub fn codex_events(raw: &str, pricing: &Pricing) -> Vec<Event> {
             num("cache_write_input_tokens"),
         );
         if let Some(t) = ts(&d) {
-            out.push(Event { ts: t, tokens, cost, model });
+            out.push(Event {
+                ts: t,
+                tokens,
+                cost,
+                model,
+            });
         }
     }
     out
@@ -236,7 +275,12 @@ mod tests {
         let mut p = Pricing::default();
         p.models.insert(
             "z-ai/glm-5.2".to_string(),
-            crate::pricing::Price { prompt: 1e-7, completion: 1e-6, cache_read: 0.0, cache_write: 0.0 },
+            crate::pricing::Price {
+                prompt: 1e-7,
+                completion: 1e-6,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
         );
         let e = pi_events(raw, "zai", &p);
         assert_eq!(e.len(), 1);
@@ -258,10 +302,30 @@ mod tests {
     fn collect_buckets_and_windows() {
         let now = Utc::now();
         let events = vec![
-            Event { ts: now - Duration::minutes(30), tokens: 100, cost: 0.0, model: "m".into() },
-            Event { ts: now - Duration::hours(10), tokens: 200, cost: 0.0, model: "m".into() },
-            Event { ts: now - Duration::days(3), tokens: 400, cost: 0.0, model: "m".into() },
-            Event { ts: now - Duration::days(30), tokens: 800, cost: 0.0, model: "m".into() },
+            Event {
+                ts: now - Duration::minutes(30),
+                tokens: 100,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::hours(10),
+                tokens: 200,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::days(3),
+                tokens: 400,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::days(30),
+                tokens: 800,
+                cost: 0.0,
+                model: "m".into(),
+            },
         ];
         let s = collect(&events);
         assert_eq!(s.requests, 4);
@@ -272,7 +336,10 @@ mod tests {
         assert_eq!(s.tokens_7d, 700);
         assert_eq!(s.spark.len(), 24);
         assert_eq!(s.spark.iter().sum::<u64>(), 300);
-        assert_eq!(s.last_request.as_deref().unwrap(), events[0].ts.to_rfc3339().as_str());
+        assert_eq!(
+            s.last_request.as_deref().unwrap(),
+            events[0].ts.to_rfc3339().as_str()
+        );
         assert_eq!(s.models[0].requests, 4);
     }
 }

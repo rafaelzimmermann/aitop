@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Row {
     pub label: String,
     pub pct: f64,
@@ -17,7 +17,7 @@ impl Row {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Panel {
     pub name: String,
     pub subtitle: String,
@@ -46,7 +46,7 @@ impl Panel {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub fetched_at: String,
     pub panels: Vec<Panel>,
@@ -90,5 +90,51 @@ pub fn fmt_tokens(n: u64) -> String {
 }
 
 pub fn fmt_money(n: f64) -> String {
-    format!("${n:.2}")
+    // per-request estimates are often sub-cent; don't collapse them to $0.00
+    if n > 0.0 && n < 0.01 {
+        format!("${n:.4}")
+    } else {
+        format!("${n:.2}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_scale_with_size() {
+        assert_eq!(fmt_duration(45), "45s");
+        assert_eq!(fmt_duration(120), "2m");
+        assert_eq!(fmt_duration(9000), "2h30m");
+        assert_eq!(fmt_duration(300000), "3d11h");
+    }
+
+    #[test]
+    fn window_labels() {
+        assert_eq!(window_label(0), "window");
+        assert_eq!(window_label(1800), "30m window");
+        assert_eq!(window_label(18000), "5h window");
+        assert_eq!(window_label(86400), "24h window");
+        assert_eq!(window_label(604800), "7d window");
+        assert_eq!(window_label(2592000), "4w window");
+    }
+
+    #[test]
+    fn number_formatting() {
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1500), "1.5k");
+        assert_eq!(fmt_tokens(2_000_000), "2.00M");
+        assert_eq!(fmt_money(12.34), "$12.34");
+        assert_eq!(fmt_money(0.000123), "$0.0001");
+    }
+
+    #[test]
+    fn rows_start_without_pace() {
+        let r = Row::new("daily", 10.0, "x".into());
+        assert_eq!(r.pace, None);
+        let p = Panel::new("codex");
+        assert_eq!(p.source, None);
+        assert!(!p.stale);
+    }
 }

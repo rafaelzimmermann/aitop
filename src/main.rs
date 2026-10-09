@@ -5,11 +5,12 @@ mod pace;
 mod pricing;
 mod providers;
 mod ui;
+mod util;
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,15 +21,20 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, backend::TestBackend, layout::Position, Terminal};
 
+use crate::config::Config;
 use crate::model::{fmt_tokens, Snapshot};
+use crate::pricing::Pricing;
 
 const HELP: &str = "aitop — htop for AI usage\n\n\
-usage: aitop [--json] [--plain] [--help]\n\n\
+usage: aitop [--json] [--plain] [--watch N] [--redact] [--help]\n\n\
   TUI keys: q quit · r refresh now · h help · 1-9 focus provider · tab/↑/↓ cycle\n\n\
 providers:\n\
   codex      GET {CODEX_BASE_URL}/codex/usage (OAuth token from CODEX_AUTH_FILE)\n\
+  claude     GET {ANTHROPIC_BASE_URL}/api/oauth/usage + local session logs\n\
+  copilot    GET {GITHUB_API_BASE_URL}/copilot_internal/user (GITHUB_TOKEN)\n\
   z.ai       no public quota API → local accounting from PI_SESSION_DIR vs ZAI_LIMIT_*\n\
-  openrouter GET {OPENROUTER_BASE_URL}/key + /credits\n";
+  openrouter GET {OPENROUTER_BASE_URL}/key + /credits\n\n\
+--plain/--json print one snapshot; add --watch N to keep refreshing every N seconds\n--redact hides the account email and API key prefixes (useful when piping --json to a file)\n";
 
 fn ascii_bar(pct: f64, width: usize) -> String {
     let filled = ((pct / 100.0).clamp(0.0, 1.0) * width as f64).round() as usize;
@@ -39,24 +45,68 @@ fn ascii_bar(pct: f64, width: usize) -> String {
     s
 }
 
+const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// One char per hourly bucket, scaled to the tallest bucket.
+fn sparkline(data: &[u64]) -> String {
+    let max = data.iter().max().copied().unwrap_or(1).max(1) as f64;
+    data.iter()
+        .map(|v| BLOCKS[(((*v as f64 / max) * 7.0).round() as usize).min(7)])
+        .collect()
+}
+
+/// `--watch N` keeps the plain/json output running instead of exiting after one shot.
+fn watch_secs(args: &[String]) -> Option<u64> {
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a.strip_prefix("--watch=") {
+            return v.trim().parse().ok();
+        }
+        if a == "--watch" {
+            return args.get(i + 1).and_then(|v| v.trim().parse().ok());
+        }
+    }
+    None
+}
+
+/// Reload the pricing map only when the cached copy has gone stale, so a long-running
+/// TUI does not keep the startup snapshot forever.
+fn refresh_pricing(cfg: &Config, pricing: &Pricing) -> Pricing {
+    if pricing.is_stale(cfg.pricing_max_age_hours) {
+        pricing::load(
+            &cfg.cache_dir,
+            &cfg.openrouter_base,
+            cfg.pricing_max_age_hours,
+        )
+    } else {
+        pricing.clone()
+    }
+}
+
 fn print_plain(snap: &Snapshot) {
     println!("aitop · {}", snap.fetched_at);
     for p in &snap.panels {
         println!("\n{}  {}", p.name, p.subtitle);
         for r in &p.rows {
+            let pace = r
+                .pace
+                .as_deref()
+                .map(|p| format!(" · {p}"))
+                .unwrap_or_default();
             println!(
-                "  {:<14} {:>5.0}%  {}  {}",
+                "  {:<14} {:>5.0}%  {}  {}{}",
                 r.label,
                 r.pct,
                 ascii_bar(r.pct, 24),
-                r.detail
+                r.detail,
+                pace
             );
         }
         if !p.spark.is_empty() {
-            let max = p.spark.iter().max().copied().unwrap_or(1).max(1);
-            let blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-            let line: String = p.spark.iter().map(|v| blocks[(((*v as f64 / max as f64) * 7.0).round() as usize).min(7)]).collect();
-            println!("  24h tokens   {:>5}   {}", fmt_tokens(p.spark.iter().sum()), line);
+            println!(
+                "  24h tokens   {:>5}   {}",
+                fmt_tokens(p.spark.iter().sum()),
+                sparkline(&p.spark)
+            );
         }
         for l in &p.lines {
             println!("  {l}");
@@ -68,27 +118,50 @@ fn print_plain(snap: &Snapshot) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = config::load();
-    let pricing = pricing::load(&cfg.cache_dir, &cfg.openrouter_base, cfg.pricing_max_age_hours);
     let args: Vec<String> = std::env::args().skip(1).collect();
-
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{HELP}");
         return Ok(());
     }
+
+    let mut cfg = config::load();
+    if args.iter().any(|a| a == "--redact") {
+        cfg.redact = true;
+    }
+    let mut pricing = pricing::load(
+        &cfg.cache_dir,
+        &cfg.openrouter_base,
+        cfg.pricing_max_age_hours,
+    );
     if args.iter().any(|a| a == "--json") {
-        let snap = providers::fetch_all(&cfg, &pricing);
-        println!("{}", serde_json::to_string_pretty(&snap)?);
+        loop {
+            let snap = providers::fetch_all(&cfg, &pricing);
+            println!("{}", serde_json::to_string_pretty(&snap)?);
+            let Some(secs) = watch_secs(&args) else { break };
+            pricing = refresh_pricing(&cfg, &pricing);
+            thread::sleep(Duration::from_secs(secs));
+        }
         return Ok(());
     }
     if args.iter().any(|a| a == "--plain" || a == "-p") {
-        print_plain(&providers::fetch_all(&cfg, &pricing));
+        loop {
+            print_plain(&providers::fetch_all(&cfg, &pricing));
+            let Some(secs) = watch_secs(&args) else { break };
+            pricing = refresh_pricing(&cfg, &pricing);
+            println!();
+            thread::sleep(Duration::from_secs(secs));
+        }
         return Ok(());
     }
 
     if args.iter().any(|a| a == "--render-test") {
         let snap = providers::fetch_all(&cfg, &pricing);
-        let state = ui::State { snapshot: snap, focus: 0, help: false, refresh_secs: cfg.refresh_secs };
+        let state = ui::State {
+            snapshot: snap,
+            focus: 0,
+            help: false,
+            refresh_secs: cfg.refresh_secs,
+        };
         let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
         terminal.draw(|f| {
             ui::draw(f, &state);
@@ -117,16 +190,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let cfg = cfg.clone();
         let force = force.clone();
-        thread::spawn(move || loop {
-            let snap = providers::fetch_all(&cfg, &pricing);
-            let _ = tx.send(snap);
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(cfg.refresh_secs.max(1)) {
-                if force.load(Ordering::Relaxed) {
-                    force.store(false, Ordering::Relaxed);
-                    break;
+        thread::spawn(move || {
+            let mut pricing = pricing;
+            loop {
+                let snap = providers::fetch_all(&cfg, &pricing);
+                let _ = tx.send(snap);
+                pricing = refresh_pricing(&cfg, &pricing);
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(cfg.refresh_secs.max(1)) {
+                    if force.load(Ordering::Relaxed) {
+                        force.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(150));
                 }
-                thread::sleep(Duration::from_millis(150));
             }
         });
     }
@@ -174,11 +251,57 @@ fn run_loop(
                         }
                     }
                     KeyCode::Tab | KeyCode::Down => state.focus = (state.focus + 1) % count,
-                    KeyCode::BackTab | KeyCode::Up => state.focus = (state.focus + count - 1) % count,
+                    KeyCode::BackTab | KeyCode::Up => {
+                        state.focus = (state.focus + count - 1) % count
+                    }
                     _ => {}
                 }
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_bar_clamps_to_width() {
+        assert_eq!(ascii_bar(0.0, 10), "░░░░░░░░░░");
+        assert_eq!(ascii_bar(50.0, 10), "█████░░░░░");
+        assert_eq!(ascii_bar(100.0, 10), "██████████");
+        assert_eq!(ascii_bar(150.0, 10), "██████████"); // clamped
+        assert_eq!(ascii_bar(-5.0, 10), "░░░░░░░░░░"); // clamped
+    }
+
+    #[test]
+    fn sparkline_scales_to_the_tallest_bucket() {
+        assert_eq!(sparkline(&[0, 1, 7]), "▁▂█");
+        assert_eq!(sparkline(&[10, 10]), "██");
+        assert_eq!(sparkline(&[]), "");
+    }
+
+    #[test]
+    fn watch_flag_is_optional_and_parsed() {
+        assert_eq!(watch_secs(&["--plain".to_string()]), None);
+        assert_eq!(
+            watch_secs(&["--plain", "--watch", "30"].map(String::from)),
+            Some(30)
+        );
+        assert_eq!(watch_secs(&["--watch=5".to_string()]), Some(5));
+        assert_eq!(watch_secs(&["--watch", "nope"].map(String::from)), None);
+    }
+
+    #[test]
+    fn fresh_pricing_is_reused_without_a_reload() {
+        let cfg = config::test_config();
+        let fresh = pricing::Pricing {
+            fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+            source: "cache".into(),
+            ..Default::default()
+        };
+        assert!(!fresh.is_stale(cfg.pricing_max_age_hours));
+        assert_eq!(refresh_pricing(&cfg, &fresh).source, "cache");
+    }
 }

@@ -16,15 +16,30 @@ pub struct Pace {
 
 /// Compare actual usage against the pace expected for the elapsed part of a window.
 /// `reset_after_secs` is the time left in the window, so elapsed = window - remaining.
-pub fn assess(window_secs: u64, reset_after_secs: u64, used_pct: f64, trigger: f64) -> Option<Pace> {
+pub fn assess(
+    window_secs: u64,
+    reset_after_secs: u64,
+    used_pct: f64,
+    trigger: f64,
+) -> Option<Pace> {
     if window_secs == 0 || reset_after_secs == 0 || reset_after_secs > window_secs {
         return None;
     }
-    assess_elapsed(window_secs - reset_after_secs, window_secs, used_pct, trigger)
+    assess_elapsed(
+        window_secs - reset_after_secs,
+        window_secs,
+        used_pct,
+        trigger,
+    )
 }
 
 /// Same idea for windows whose start we only know from local logs (or calendar).
-pub fn assess_elapsed(elapsed_secs: u64, window_secs: u64, used_pct: f64, trigger: f64) -> Option<Pace> {
+pub fn assess_elapsed(
+    elapsed_secs: u64,
+    window_secs: u64,
+    used_pct: f64,
+    trigger: f64,
+) -> Option<Pace> {
     if window_secs == 0 || elapsed_secs == 0 || elapsed_secs > window_secs {
         return None;
     }

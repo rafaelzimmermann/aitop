@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Rolling-window token limits (z.ai exposes no public quota API, so these are
 /// user-configurable and used purely for local accounting bars).
@@ -13,8 +13,9 @@ pub struct Limits {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub refresh_secs: u64,
+    /// hide account identity (email, key prefixes) in output
+    pub redact: bool,
 
-    pub home: PathBuf,
     pub cache_dir: PathBuf,
 
     pub codex_auth_file: PathBuf,
@@ -69,6 +70,16 @@ fn env_num(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_bool(key: &str, default: bool) -> bool {
+    match env_opt(key) {
+        Some(v) => matches!(
+            v.trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => default,
+    }
+}
+
 fn env_float(key: &str, default: f64) -> f64 {
     env_opt(key)
         .and_then(|v| v.trim().parse::<f64>().ok())
@@ -89,7 +100,7 @@ fn parse_github_token(raw: &str) -> Option<String> {
 }
 
 /// GitHub token: env wins, then gh's own config file.
-fn github_token(h: &PathBuf) -> Option<String> {
+fn github_token(h: &Path) -> Option<String> {
     for k in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Some(t) = env_opt(k) {
             return Some(t);
@@ -115,23 +126,40 @@ pub fn load() -> Config {
 
     let h = home();
     let providers = env_opt("PROVIDERS")
-        .map(|s| s.split(',').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
         .unwrap_or_else(|| vec!["codex".into(), "z.ai".into(), "openrouter".into()]);
 
     Config {
         refresh_secs: env_num("REFRESH_SECONDS", 5),
-        home: h.clone(),
-        cache_dir: PathBuf::from(env("AITOP_CACHE_DIR", &h.join(".cache/aitop").display().to_string())),
+        redact: env_bool("AITOP_REDACT", false),
+        cache_dir: PathBuf::from(env(
+            "AITOP_CACHE_DIR",
+            &h.join(".cache/aitop").display().to_string(),
+        )),
 
-        codex_auth_file: PathBuf::from(env("CODEX_AUTH_FILE", &h.join(".codex/auth.json").display().to_string())),
+        codex_auth_file: PathBuf::from(env(
+            "CODEX_AUTH_FILE",
+            &h.join(".codex/auth.json").display().to_string(),
+        )),
         codex_token: env_opt("CODEX_ACCESS_TOKEN"),
         codex_base: env("CODEX_BASE_URL", "https://chatgpt.com/backend-api"),
-        codex_installation_id: env_opt("CODEX_INSTALLATION_ID")
-            .or_else(|| std::fs::read_to_string(h.join(".codex/installation_id")).ok().map(|s| s.trim().to_string())),
+        codex_installation_id: env_opt("CODEX_INSTALLATION_ID").or_else(|| {
+            std::fs::read_to_string(h.join(".codex/installation_id"))
+                .ok()
+                .map(|s| s.trim().to_string())
+        }),
         codex_client_id: env("CODEX_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann"),
         auth_base: env("OPENAI_AUTH_BASE_URL", "https://auth.openai.com"),
 
-        claude_credentials_file: PathBuf::from(env("CLAUDE_CREDENTIALS_FILE", &h.join(".claude/.credentials.json").display().to_string())),
+        claude_credentials_file: PathBuf::from(env(
+            "CLAUDE_CREDENTIALS_FILE",
+            &h.join(".claude/.credentials.json").display().to_string(),
+        )),
         anthropic_base: env("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
 
         github_token: github_token(&h),
@@ -143,8 +171,14 @@ pub fn load() -> Config {
         openrouter_key: env_opt("OPENROUTER_API_KEY"),
         openrouter_base: env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
 
-        codex_session_dir: PathBuf::from(env("CODEX_SESSION_DIR", &h.join(".codex/sessions").display().to_string())),
-        pi_session_dir: PathBuf::from(env("PI_SESSION_DIR", &h.join(".pi/agent/sessions").display().to_string())),
+        codex_session_dir: PathBuf::from(env(
+            "CODEX_SESSION_DIR",
+            &h.join(".codex/sessions").display().to_string(),
+        )),
+        pi_session_dir: PathBuf::from(env(
+            "PI_SESSION_DIR",
+            &h.join(".pi/agent/sessions").display().to_string(),
+        )),
 
         zai_limits: Limits {
             five_hour: env_num("ZAI_LIMIT_5H", 200_000),
@@ -172,18 +206,24 @@ pub fn codex_access_token(cfg: &Config) -> Option<String> {
     if let Some(t) = &cfg.codex_token {
         return Some(t.clone());
     }
-    parse_auth_token(&std::fs::read_to_string(&cfg.codex_auth_file).ok()?, "access_token")
+    parse_auth_token(
+        &std::fs::read_to_string(&cfg.codex_auth_file).ok()?,
+        "access_token",
+    )
 }
 
 pub fn codex_refresh_token(cfg: &Config) -> Option<String> {
-    parse_auth_token(&std::fs::read_to_string(&cfg.codex_auth_file).ok()?, "refresh_token")
+    parse_auth_token(
+        &std::fs::read_to_string(&cfg.codex_auth_file).ok()?,
+        "refresh_token",
+    )
 }
 
 #[cfg(test)]
 pub fn test_config() -> Config {
     Config {
         refresh_secs: 5,
-        home: PathBuf::from("/tmp/aitop-test-home"),
+        redact: false,
         cache_dir: PathBuf::from("/tmp/aitop-test-cache"),
         codex_auth_file: PathBuf::from("/tmp/aitop-test-home/.codex/auth.json"),
         codex_token: None,
@@ -201,7 +241,12 @@ pub fn test_config() -> Config {
         openrouter_base: "https://openrouter.ai/api/v1".into(),
         codex_session_dir: PathBuf::from("/tmp/aitop-test-home/.codex/sessions"),
         pi_session_dir: PathBuf::from("/tmp/aitop-test-home/.pi/agent/sessions"),
-        zai_limits: Limits { five_hour: 200_000, day: 1_000_000, week: 5_000_000, rpm: 30 },
+        zai_limits: Limits {
+            five_hour: 200_000,
+            day: 1_000_000,
+            week: 5_000_000,
+            rpm: 30,
+        },
         pace_trigger: 10.0,
         pricing_max_age_hours: 24,
         providers: vec!["codex".into()],
@@ -233,7 +278,10 @@ mod tests {
     fn gh_hosts_file_is_parsed() {
         let raw = "github.com:\n  oauth_token: ght_abc123\n  user: me\n";
         assert_eq!(parse_github_token(raw).as_deref(), Some("ght_abc123"));
-        assert_eq!(parse_github_token("github.com:\n  oauth_token: \"ght_quoted\"\n").as_deref(), Some("ght_quoted"));
+        assert_eq!(
+            parse_github_token("github.com:\n  oauth_token: \"ght_quoted\"\n").as_deref(),
+            Some("ght_quoted")
+        );
         assert_eq!(parse_github_token("github.com:\n  oauth_token: \n"), None);
     }
 
@@ -242,7 +290,11 @@ mod tests {
         let dir = std::env::temp_dir().join("aitop-test-auth");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("auth.json");
-        std::fs::write(&path, r#"{"tokens":{"access_token":"tok-a","refresh_token":"tok-r"}}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"tokens":{"access_token":"tok-a","refresh_token":"tok-r"}}"#,
+        )
+        .unwrap();
 
         let mut cfg = test_config();
         cfg.codex_auth_file = path.clone();
