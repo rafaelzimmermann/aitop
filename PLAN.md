@@ -46,9 +46,11 @@ Each provider is `fetch → parse → panel_builder`; the JSON→Panel part is p
 
 ## 6. Remaining
 
-- [ ] persist per-provider limits history so pace can compare against plan caps
-      (e.g. `~/.cache/aitop/limits.json`: `{provider: {window, cap, source}}`), so a
-      plan change is visible as "cap went 5M → 10M" instead of a hardcoded `ZAI_LIMIT_*`
+- [x] persist per-provider limits history so pace can compare against plan caps
+      (`src/history.rs`, `~/.cache/aitop/limits.json`: `{provider/window: {cap, first_seen,
+      last_seen, prev}}`), so a plan change is visible as "cap went 5M → 10M" instead of a
+      hardcoded `ZAI_LIMIT_*`. Rows carry a `cap` field (also in `--json`); the first sighting
+      is silent, a change prints one line per run.
 - [ ] z.ai: derive the cap from the live `x-ratelimit-*` headers when the gateway sends
       them, falling back to `ZAI_LIMIT_*`
 - [ ] optional: `--history` sparkline over 7d instead of 24h (needs the same history file)

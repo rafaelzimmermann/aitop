@@ -4,6 +4,8 @@ pub struct Row {
     pub pct: f64,
     pub detail: String,
     pub pace: Option<String>,
+    /// cap in use for this window, as displayed (e.g. "200.0k", "$30.00")
+    pub cap: Option<String>,
 }
 
 impl Row {
@@ -13,7 +15,12 @@ impl Row {
             pct,
             detail,
             pace: None,
+            cap: None,
         }
+    }
+
+    pub fn set_cap(&mut self, cap: &str) {
+        self.cap = Some(cap.to_string());
     }
 }
 
@@ -133,6 +140,7 @@ mod tests {
     fn rows_start_without_pace() {
         let r = Row::new("daily", 10.0, "x".into());
         assert_eq!(r.pace, None);
+        assert_eq!(r.cap, None);
         let p = Panel::new("codex");
         assert_eq!(p.source, None);
         assert!(!p.stale);

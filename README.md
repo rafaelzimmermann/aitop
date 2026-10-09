@@ -84,7 +84,7 @@ Lookup order: `AITOP_ENV` → `./.env` → `~/.config/aitop/.env` → project `.
 | `ZAI_LIMIT_5H` / `ZAI_LIMIT_DAY` / `ZAI_LIMIT_WEEK` / `ZAI_LIMIT_RPM` | assumed caps for the local z.ai accounting — tune to your plan |
 | `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` | OpenRouter key + base |
 | `CODEX_SESSION_DIR` / `PI_SESSION_DIR` | local session-log directories used for the 24h sparkline and local accounting |
-| `AITOP_CACHE_DIR` | `~/.cache/aitop` — panel snapshots + pricing cache, created 0700, files 0600 |
+| `AITOP_CACHE_DIR` | `~/.cache/aitop` — panel snapshots, pricing cache and `limits.json`, created 0700, files 0600 |
 | `PRICING_CACHE_HOURS` | pricing cache TTL (default 24) |
 | `PACE_TRIGGER` | pace ahead/behind threshold (default 10) |
 | `AITOP_REDACT` | `1` hides email + key prefixes (same as `--redact`) |
@@ -102,3 +102,6 @@ The Codex usage endpoint returns `403` without a `codex_cli_rs/*` User-Agent, so
   if you do not want identity in the output.
 - `--json` is a single snapshot unless you pass `--watch N`; nothing is written to stdout
   by the refresh thread itself.
+- Caps in use are remembered per provider/window in `~/.cache/aitop/limits.json`. When a cap
+  changes between runs (you tune `ZAI_LIMIT_*`, or a plan changes), the panel prints
+  `cap 5.00M → 10.00M (first seen …)` once. `--json` rows carry `cap` for the same reason.

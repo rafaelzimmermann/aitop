@@ -4,6 +4,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde_json::Value;
 
 use crate::config::{self, Config};
+use crate::history;
 use crate::local;
 use crate::model::{fmt_duration, fmt_money, fmt_tokens, window_label, Panel, Row, Snapshot};
 use crate::pace;
@@ -91,17 +92,8 @@ fn num(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_f64())
 }
 
-fn add_row(
-    p: &mut Panel,
-    cfg: &Config,
-    label: String,
-    pct: f64,
-    detail: String,
-    window_secs: u64,
-    reset_after: u64,
-) {
-    let mut r = Row::new(&label, pct, detail);
-    if let Some(pa) = pace::assess(window_secs, reset_after, pct, cfg.pace_trigger) {
+fn add_row(p: &mut Panel, cfg: &Config, mut r: Row, window_secs: u64, reset_after: u64) {
+    if let Some(pa) = pace::assess(window_secs, reset_after, r.pct, cfg.pace_trigger) {
         r.pace = Some(pace::label(&pa));
     }
     p.rows.push(r);
@@ -131,6 +123,7 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
             fmt_tokens(l.five_hour)
         ),
     );
+    r.set_cap(&fmt_tokens(l.five_hour));
     if let Some(pa) =
         pace::assess_elapsed(elapsed(&stats.first_5h), 5 * 3600, r.pct, cfg.pace_trigger)
     {
@@ -143,6 +136,7 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
         pct(stats.tokens_24h, l.day),
         format!("{} / {}", fmt_tokens(stats.tokens_24h), fmt_tokens(l.day)),
     );
+    r.set_cap(&fmt_tokens(l.day));
     if let Some(pa) = pace::assess_elapsed(
         elapsed(&stats.first_24h),
         24 * 3600,
@@ -158,6 +152,7 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
         pct(stats.tokens_7d, l.week),
         format!("{} / {}", fmt_tokens(stats.tokens_7d), fmt_tokens(l.week)),
     );
+    r.set_cap(&fmt_tokens(l.week));
     if let Some(pa) =
         pace::assess_elapsed(elapsed(&stats.first_7d), 7 * 86400, r.pct, cfg.pace_trigger)
     {
@@ -166,11 +161,13 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
     p.rows.push(r);
 
     let rpm = stats.requests_5h as f64 / 5.0;
-    p.rows.push(Row::new(
+    let mut r = Row::new(
         "avg rpm",
         pct(rpm as u64, l.rpm),
         format!("{:.1} / {}", rpm, l.rpm),
-    ));
+    );
+    r.set_cap(&l.rpm.to_string());
+    p.rows.push(r);
 }
 
 fn add_local_lines(p: &mut Panel, stats: &local::Stats) {
@@ -278,7 +275,13 @@ fn codex_panel(cfg: &Config, pricing: &Pricing, v: &Value) -> Panel {
             } else {
                 "no reset".into()
             };
-            add_row(&mut p, cfg, window_label(secs), pct, detail, secs, reset);
+            add_row(
+                &mut p,
+                cfg,
+                Row::new(&window_label(secs), pct, detail),
+                secs,
+                reset,
+            );
         }
         if rl
             .get("limit_reached")
@@ -315,15 +318,12 @@ fn codex_panel(cfg: &Config, pricing: &Pricing, v: &Value) -> Panel {
                 .get("limit_name")
                 .and_then(|x| x.as_str())
                 .unwrap_or("extra");
-            add_row(
-                &mut p,
-                cfg,
-                format!("{name} {}", window_label(secs)),
+            let r = Row::new(
+                &format!("{name} {}", window_label(secs)),
                 pct,
                 format!("resets in {}", fmt_duration(reset)),
-                secs,
-                reset,
             );
+            add_row(&mut p, cfg, r, secs, reset);
         }
     }
 
@@ -466,9 +466,11 @@ fn claude_panel(
             add_row(
                 &mut p,
                 cfg,
-                window_label(window),
-                pct,
-                format!("resets in {}", fmt_duration(reset)),
+                Row::new(
+                    &window_label(window),
+                    pct,
+                    format!("resets in {}", fmt_duration(reset)),
+                ),
                 window,
                 reset,
             );
@@ -608,15 +610,11 @@ fn copilot_panel(cfg: &Config, v: &Value, error: Option<String>) -> Panel {
                 fmt_tokens(remaining.unwrap_or(0.0) as u64),
                 fmt_tokens(entitlement.unwrap_or(0.0) as u64)
             );
-            add_row(
-                &mut p,
-                cfg,
-                format!("{name} (month)"),
-                used,
-                detail,
-                30 * 86400,
-                reset,
-            );
+            let mut r = Row::new(&format!("{name} (month)"), used, detail);
+            if let Some(e) = entitlement {
+                r.set_cap(&fmt_tokens(e as u64));
+            }
+            add_row(&mut p, cfg, r, 30 * 86400, reset);
             shown += 1;
             if shown >= 3 {
                 break;
@@ -729,15 +727,19 @@ fn openrouter_panel(
     } else {
         0.0
     };
-    p.rows.push(Row::new(
+    let mut credits_row = Row::new(
         "credits",
         pct,
         format!("{} used of {}", fmt_money(usage), fmt_money(total_credits)),
-    ));
+    );
+    if total_credits > 0.0 {
+        credits_row.set_cap(&fmt_money(total_credits));
+    }
+    p.rows.push(credits_row);
 
     if let Some(lim) = num(d, "limit") {
         let remaining = num(d, "limit_remaining").unwrap_or(0.0);
-        p.rows.push(Row::new(
+        let mut r = Row::new(
             "key limit",
             if lim > 0.0 {
                 ((lim - remaining) / lim) * 100.0
@@ -745,7 +747,11 @@ fn openrouter_panel(
                 0.0
             },
             format!("{} left of {}", fmt_money(remaining), fmt_money(lim)),
-        ));
+        );
+        if lim > 0.0 {
+            r.set_cap(&fmt_money(lim));
+        }
+        p.rows.push(r);
     }
 
     let now = Utc::now();
@@ -866,7 +872,21 @@ fn merge_cached(cfg: &Config, p: &mut Panel) {
     }
 }
 
+/// Caps that changed since the last run, as one line per row.
+fn cap_notes(hist: &mut history::History, p: &Panel, now: &str) -> Vec<String> {
+    p.rows
+        .iter()
+        .filter_map(|r| {
+            r.cap
+                .as_ref()
+                .and_then(|c| hist.note(&p.name, &r.label, c, now))
+        })
+        .collect()
+}
+
 pub fn fetch_all(cfg: &Config, pricing: &Pricing) -> Snapshot {
+    let mut hist = history::History::load(&cfg.cache_dir);
+    let now = Utc::now().to_rfc3339();
     let mut panels = Vec::new();
     for name in &cfg.providers {
         let mut p = match name.as_str() {
@@ -882,10 +902,13 @@ pub fn fetch_all(cfg: &Config, pricing: &Pricing) -> Snapshot {
             }
         };
         merge_cached(cfg, &mut p);
+        let notes = cap_notes(&mut hist, &p, &now);
+        p.lines.extend(notes);
         panels.push(p);
     }
+    hist.save(&cfg.cache_dir);
     Snapshot {
-        fetched_at: Utc::now().to_rfc3339(),
+        fetched_at: now,
         panels,
     }
 }
@@ -1167,5 +1190,24 @@ mod tests {
         assert!(failed.stale);
         assert_eq!(failed.error.as_deref(), Some("401 unauthorized"));
         let _ = std::fs::remove_dir_all(&cfg.cache_dir);
+    }
+
+    #[test]
+    fn a_plan_cap_change_is_reported_once() {
+        let mut p = Panel::new("z.ai");
+        let mut r = Row::new("weekly", 80.0, "4.00M / 5.00M".into());
+        r.set_cap("5.00M");
+        p.rows.push(r);
+
+        let mut hist = history::History::default();
+        assert!(cap_notes(&mut hist, &p, "2026-10-09T00:00:00Z").is_empty());
+
+        // the plan cap changes; the next run says so, then stays quiet
+        p.rows[0].set_cap("10.00M");
+        assert_eq!(
+            cap_notes(&mut hist, &p, "2026-10-10T00:00:00Z"),
+            vec!["cap 5.00M → 10.00M (first seen 2026-10-09T00:00:00Z)".to_string()]
+        );
+        assert!(cap_notes(&mut hist, &p, "2026-10-11T00:00:00Z").is_empty());
     }
 }
