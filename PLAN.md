@@ -52,6 +52,8 @@ Each provider is `fetch → parse → panel_builder`; the JSON→Panel part is p
       hardcoded `ZAI_LIMIT_*`. Rows carry a `cap` field (also in `--json`); the first sighting
       is silent, a change prints one line per run.
 - [ ] z.ai: derive the cap from the live `x-ratelimit-*` headers when the gateway sends
-      them, falling back to `ZAI_LIMIT_*`
-- [ ] optional: `--history` sparkline over 7d instead of 24h (needs the same history file)
+      them, falling back to `ZAI_LIMIT_*`. Checked 2026-10-09: `api.z.ai` returns no
+      `x-ratelimit-*` headers at all, so the probe only prints them when they appear.
+- [x] optional: `--history` sparkline over 7d instead of 24h (`Stats.daily`, 7 daily buckets,
+      exposed as `spark_label` in plain output and `--json`)
 - [ ] CI runs `cargo fmt --check`; the tree is formatted, keep it that way

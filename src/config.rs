@@ -15,6 +15,8 @@ pub struct Config {
     pub refresh_secs: u64,
     /// hide account identity (email, key prefixes) in output
     pub redact: bool,
+    /// sparkline over 7 daily buckets instead of 24 hourly ones
+    pub history: bool,
 
     pub cache_dir: PathBuf,
 
@@ -137,6 +139,7 @@ pub fn load() -> Config {
     Config {
         refresh_secs: env_num("REFRESH_SECONDS", 5),
         redact: env_bool("AITOP_REDACT", false),
+        history: env_bool("AITOP_HISTORY", false),
         cache_dir: PathBuf::from(env(
             "AITOP_CACHE_DIR",
             &h.join(".cache/aitop").display().to_string(),
@@ -224,6 +227,7 @@ pub fn test_config() -> Config {
     Config {
         refresh_secs: 5,
         redact: false,
+        history: false,
         cache_dir: PathBuf::from("/tmp/aitop-test-cache"),
         codex_auth_file: PathBuf::from("/tmp/aitop-test-home/.codex/auth.json"),
         codex_token: None,

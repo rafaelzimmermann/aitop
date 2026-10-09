@@ -31,6 +31,8 @@ pub struct Panel {
     pub rows: Vec<Row>,
     pub lines: Vec<String>,
     pub spark: Vec<u64>,
+    /// what the spark series measures ("24h tokens", "7d tokens")
+    pub spark_label: String,
     pub error: Option<String>,
     /// true when the values shown are the last good ones, not a live fetch
     pub stale: bool,
@@ -46,6 +48,7 @@ impl Panel {
             rows: Vec::new(),
             lines: Vec::new(),
             spark: Vec::new(),
+            spark_label: "24h tokens".to_string(),
             error: None,
             stale: false,
             source: None,

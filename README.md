@@ -37,6 +37,7 @@ aitop --plain          # one-shot text snapshot (scriptable)
 aitop --plain --watch 30
 aitop --json           # one-shot JSON snapshot
 aitop --json --redact  # no email / key prefix in the output
+aitop --plain --history # sparkline over 7 daily buckets instead of 24 hourly ones
 aitop --help
 ```
 

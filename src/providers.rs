@@ -170,7 +170,7 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
     p.rows.push(r);
 }
 
-fn add_local_lines(p: &mut Panel, stats: &local::Stats) {
+fn add_local_lines(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
     p.lines.push(format!(
         "requests: {} total · {} in last 5h",
         stats.requests, stats.requests_5h
@@ -198,7 +198,13 @@ fn add_local_lines(p: &mut Panel, stats: &local::Stats) {
     if let Some(last) = &stats.last_request {
         p.lines.push(format!("last request: {last}"));
     }
-    p.spark = stats.spark.clone();
+    if cfg.history {
+        p.spark = stats.daily.clone();
+        p.spark_label = "7d tokens".to_string();
+    } else {
+        p.spark = stats.spark.clone();
+        p.spark_label = "24h tokens".to_string();
+    }
 }
 
 // ---------------------------------------------------------------- Codex
@@ -371,7 +377,7 @@ fn codex_panel(cfg: &Config, pricing: &Pricing, v: &Value) -> Panel {
         stats.requests,
         fmt_tokens(stats.tokens_24h)
     ));
-    add_local_lines(&mut p, &stats);
+    add_local_lines(&mut p, cfg, &stats);
     p
 }
 
@@ -487,7 +493,7 @@ fn claude_panel(
             fmt_tokens(stats.total),
             stats.requests
         ));
-        add_local_lines(&mut p, &stats);
+        add_local_lines(&mut p, cfg, &stats);
     }
     p
 }
@@ -662,7 +668,7 @@ fn zai_panel(cfg: &Config, stats: &local::Stats, probe_lines: &[String]) -> Pane
     for l in probe_lines {
         p.lines.push(l.clone());
     }
-    add_local_lines(&mut p, stats);
+    add_local_lines(&mut p, cfg, stats);
     p
 }
 

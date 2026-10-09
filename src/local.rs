@@ -22,6 +22,7 @@ pub struct Stats {
     pub requests_5h: u64,
     pub last_request: Option<String>,
     pub spark: Vec<u64>, // last 24 hourly buckets, oldest first
+    pub daily: Vec<u64>, // last 7 daily buckets, oldest first
     pub cost_total: f64,
     pub cost_24h: f64,
     pub models: Vec<ModelStat>,
@@ -42,6 +43,7 @@ fn collect(events: &[Event]) -> Stats {
     let now = Utc::now();
     let mut s = Stats::default();
     let mut buckets = vec![0u64; 24];
+    let mut daily = vec![0u64; 7];
     let mut newest: Option<DateTime<Utc>> = None;
     let mut models: BTreeMap<String, ModelStat> = BTreeMap::new();
 
@@ -62,6 +64,7 @@ fn collect(events: &[Event]) -> Stats {
         }
         if e.ts > now - Duration::days(7) {
             s.tokens_7d += e.tokens;
+            daily[(6 - ((now - e.ts).num_days() as usize)).min(6)] += e.tokens;
             s.first_7d = Some(s.first_7d.map(|f| e.ts.min(f)).unwrap_or(e.ts));
         }
         if e.ts > now - Duration::hours(24) {
@@ -85,6 +88,7 @@ fn collect(events: &[Event]) -> Stats {
 
     s.last_request = newest.map(|t| t.to_rfc3339());
     s.spark = buckets;
+    s.daily = daily;
     s.models = models.into_values().collect();
     s.models.sort_by(|a, b| b.tokens.cmp(&a.tokens));
     s
@@ -336,6 +340,11 @@ mod tests {
         assert_eq!(s.tokens_7d, 700);
         assert_eq!(s.spark.len(), 24);
         assert_eq!(s.spark.iter().sum::<u64>(), 300);
+        assert_eq!(s.daily.len(), 7);
+        assert_eq!(s.daily.iter().sum::<u64>(), 700);
+        assert_eq!(s.daily[6], 300); // today: 30min ago + 10h ago
+        assert_eq!(s.daily[3], 400); // three days ago
+        assert_eq!(s.daily[0], 0); // the 30-day-old event is outside the window
         assert_eq!(
             s.last_request.as_deref().unwrap(),
             events[0].ts.to_rfc3339().as_str()

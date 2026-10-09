@@ -27,7 +27,7 @@ use crate::model::{fmt_tokens, Snapshot};
 use crate::pricing::Pricing;
 
 const HELP: &str = "aitop — htop for AI usage\n\n\
-usage: aitop [--json] [--plain] [--watch N] [--redact] [--help]\n\n\
+usage: aitop [--json] [--plain] [--watch N] [--redact] [--history] [--help]\n\n\
   TUI keys: q quit · r refresh now · h help · 1-9 focus provider · tab/↑/↓ cycle\n\n\
 providers:\n\
   codex      GET {CODEX_BASE_URL}/codex/usage (OAuth token from CODEX_AUTH_FILE)\n\
@@ -35,7 +35,7 @@ providers:\n\
   copilot    GET {GITHUB_API_BASE_URL}/copilot_internal/user (GITHUB_TOKEN)\n\
   z.ai       no public quota API → local accounting from PI_SESSION_DIR vs ZAI_LIMIT_*\n\
   openrouter GET {OPENROUTER_BASE_URL}/key + /credits\n\n\
---plain/--json print one snapshot; add --watch N to keep refreshing every N seconds\n--redact hides the account email and API key prefixes (useful when piping --json to a file)\n";
+--plain/--json print one snapshot; add --watch N to keep refreshing every N seconds\n--redact hides the account email and API key prefixes (useful when piping --json to a file)\n--history draws the sparkline over 7 daily buckets instead of 24 hourly ones\n";
 
 fn ascii_bar(pct: f64, width: usize) -> String {
     let filled = ((pct / 100.0).clamp(0.0, 1.0) * width as f64).round() as usize;
@@ -49,6 +49,10 @@ fn ascii_bar(pct: f64, width: usize) -> String {
 const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// One char per hourly bucket, scaled to the tallest bucket.
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
 fn sparkline(data: &[u64]) -> String {
     let max = data.iter().max().copied().unwrap_or(1).max(1) as f64;
     data.iter()
@@ -104,7 +108,8 @@ fn print_plain(snap: &Snapshot) {
         }
         if !p.spark.is_empty() {
             println!(
-                "  24h tokens   {:>5}   {}",
+                "  {:<12} {:>5}   {}",
+                p.spark_label,
                 fmt_tokens(p.spark.iter().sum()),
                 sparkline(&p.spark)
             );
@@ -126,15 +131,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut cfg = config::load();
-    if args.iter().any(|a| a == "--redact") {
+    if has_flag(&args, "--redact") {
         cfg.redact = true;
+    }
+    if has_flag(&args, "--history") {
+        cfg.history = true;
     }
     let mut pricing = pricing::load(
         &cfg.cache_dir,
         &cfg.openrouter_base,
         cfg.pricing_max_age_hours,
     );
-    if args.iter().any(|a| a == "--json") {
+    if has_flag(&args, "--json") {
         loop {
             let snap = providers::fetch_all(&cfg, &pricing);
             println!("{}", serde_json::to_string_pretty(&snap)?);
@@ -144,7 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    if args.iter().any(|a| a == "--plain" || a == "-p") {
+    if has_flag(&args, "--plain") || has_flag(&args, "-p") {
         loop {
             print_plain(&providers::fetch_all(&cfg, &pricing));
             let Some(secs) = watch_secs(&args) else { break };
@@ -155,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if args.iter().any(|a| a == "--render-test") {
+    if has_flag(&args, "--render-test") {
         let snap = providers::fetch_all(&cfg, &pricing);
         let state = ui::State {
             snapshot: snap,
@@ -281,6 +289,13 @@ mod tests {
         assert_eq!(sparkline(&[0, 1, 7]), "▁▂█");
         assert_eq!(sparkline(&[10, 10]), "██");
         assert_eq!(sparkline(&[]), "");
+    }
+
+    #[test]
+    fn flags_are_optional() {
+        let args = ["--plain", "--history"].map(String::from);
+        assert!(has_flag(&args, "--history"));
+        assert!(!has_flag(&args, "--redact"));
     }
 
     #[test]
