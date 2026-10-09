@@ -1,120 +1,154 @@
 # aitop
 
-`htop` for AI usage — a live terminal dashboard for provider quotas.
+**`htop` for AI usage.** A live terminal dashboard for quotas, reset timers, balances, and local token throughput—one Rust binary, with plain-text and JSON output for scripts.
 
-```
- 1 codex  2 claude  3 copilot  4 z.ai  5 openrouter  · 2026-10-09T05:23:31Z
-┌codex · live quota API────────────────────────────────┐
-│plus · you@example.com                                │
-│███              5h window   3%  resets in 3h16m      │
-│████████████████ 7d window  17%  resets in 5d01h      │
-│                          gpt-reserve 7d  0%  ...     │
-└──────────────────────────────────────────────────────┘
-┌z.ai · local accounting (not a server quota)──────────┐
-│key 3af1… · no public quota API → local accounting    │
-│██████████████████ 5h window  80%  159.0k / 200.0k    │
-│                       24h tokens  1.2M  ▁▂▄▆█▇▆▃     │
-└──────────────────────────────────────────────────────┘
-```
+[![CI](https://github.com/rafaelzimmermann/aitop/actions/workflows/ci.yml/badge.svg)](https://github.com/rafaelzimmermann/aitop/actions/workflows/ci.yml)
 
-Panel titles show the data source, and `stale` when the numbers come from the last good
-snapshot instead of a live fetch.
+- Track Codex, Claude, Copilot, z.ai, OpenRouter, and DeepSeek in one place.
+- Inspect Strata and Ollama engine state alongside local session activity.
+- See rolling quota windows, reset countdowns, spending budgets, and usage pace.
+- Zoom into a provider or use the two-column overview on terminals at least 110 columns wide.
+- Distinguish live provider data, local estimates, and stale cached snapshots in panel titles.
 
-## Run
+## Install
+
+Build from source with a current stable [Rust toolchain](https://www.rust-lang.org/tools/install) and Git:
 
 ```bash
-./install.sh            # build + install to ~/.local/bin (seeds ~/.config/aitop/.env)
-./install.sh --run      # install and print one snapshot
-./install.sh --prefix /usr/local
-./install.sh --uninstall
+git clone https://github.com/rafaelzimmermann/aitop.git
+cd aitop
+cargo install --path . --locked
+aitop
 ```
 
-Then:
+Alternatively, the Bash installer builds a release binary into `~/.local/bin` and seeds `~/.config/aitop/.env` from your project `.env`, or from `.env.example` when no project config exists:
 
 ```bash
-aitop                  # TUI
-aitop --plain          # one-shot text snapshot (scriptable)
-aitop --plain --watch 30
-aitop --json           # one-shot JSON snapshot
-aitop --json --redact  # no email / key prefix in the output
-aitop --plain --history # sparkline over 7 daily buckets instead of 24 hourly ones
+./install.sh
+./install.sh --run                # install and print a snapshot
+./install.sh --prefix /usr/local  # choose an installation prefix
+./install.sh --no-config          # skip config creation
+./install.sh --uninstall          # remove the installed binary
+```
+
+The installer uses `readlink -f`; on systems without it, use `cargo install` above. Ensure the chosen binary directory is on your `PATH`.
+
+## Quick start
+
+Existing Codex and Claude credentials and GitHub CLI authentication are discovered automatically. For API keys and provider selection, copy the configuration template and edit it locally:
+
+```bash
+mkdir -p ~/.config/aitop
+cp .env.example ~/.config/aitop/.env  # first-time setup; preserve an existing config
+chmod 600 ~/.config/aitop/.env
+```
+
+The default panels are `codex,deepseek,z.ai,openrouter`. Choose your own order:
+
+```bash
+PROVIDERS=codex,claude,copilot,z.ai,openrouter,deepseek aitop
+PROVIDERS=strata,ollama aitop
+```
+
+```bash
+aitop                         # interactive dashboard
+aitop --plain                 # one text snapshot
+aitop --json --redact          # JSON with account email and key prefixes hidden
+aitop --plain --watch 30       # refresh every 30 seconds
+aitop --plain --history        # seven daily sparkline buckets instead of 24 hourly ones
 aitop --help
 ```
 
-TUI keys: `q` quit · `r` refresh now · `h` help · `Enter` zoom focused panel · `j`/`k` or `↑`/`↓` scroll when zoomed (cycle focus when not) · `Tab` cycle focus · `1-9` focus provider. On wide terminals (≥110 cols) panels tile into two columns.
+`--plain` and `--json` exit after one snapshot unless `--watch N` is supplied. Watched JSON output is a sequence of pretty-printed JSON objects.
 
-## Data sources
+### Keyboard controls
 
-| provider   | source                                                            |
-|------------|-------------------------------------------------------------------|
-| codex      | `GET https://chatgpt.com/backend-api/codex/usage` (OAuth token from `~/.codex/auth.json`) + local `~/.codex/sessions/**/rollout-*.jsonl` (`token_count` events) |
-| claude     | `GET https://api.anthropic.com/api/oauth/usage` (OAuth refresh token from `~/.claude/.credentials.json`, or an `sk-` key) + local pi logs |
-| copilot    | `GET https://api.github.com/copilot_internal/user` (`GITHUB_TOKEN`, `gh` token, or `~/.config/gh/oauth_token`) |
-| z.ai       | live quota API `GET {host}/api/monitor/usage/quota/limit` (the endpoint the glm-plan-usage plugins use; same Bearer key as `ZAI_API_KEY`) → 5h/weekly quota rows with exact percentages and reset times; falls back to local accounting from `~/.pi/agent/sessions` compared against configurable `ZAI_LIMIT_*` when the endpoint is unavailable; plus a live `/models` probe that prints any `x-ratelimit-*` headers the gateway returns |
-| openrouter | `GET https://openrouter.ai/api/v1/key` and `/api/v1/credits`     |
-| deepseek   | `GET https://api.deepseek.com/user/balance` (`DEEPSEEK_API_KEY`) — the official account balance (lifetime, not a rolling quota) plus local session activity from `PI_SESSION_DIR` |
-| any other  | no quota API → local session logs (`PROVIDERS=ollama,strata`), reported as totals plus output tok/s (generation time measured from each assistant message to its parent) |
+| Key | Action |
+| --- | --- |
+| `q` / `Ctrl-C` | Quit |
+| `r` | Request a refresh |
+| `h` | Toggle help |
+| `Tab` / `Shift-Tab` | Next / previous provider |
+| `1`–`9` | Focus a provider |
+| `Enter` | Toggle focused-panel zoom |
+| `j` / `k` or `↓` / `↑` | Cycle providers; scroll details when zoomed |
+| `Esc` | Leave zoom, or quit from the overview |
 
-Model pricing for the local accounting comes from `GET {OPENROUTER_BASE_URL}/models`,
-cached in `~/.cache/aitop/pricing.json` for `PRICING_CACHE_HOURS` (24 by default).
+## Providers and data sources
 
-## Pace
+| Provider | Live data | Credentials / local data |
+| --- | --- | --- |
+| **Codex** | Quota windows from `/backend-api/codex/usage` | `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN`; rollout logs under `~/.codex/sessions` |
+| **Claude** | OAuth usage from `/api/oauth/usage` | Claude Code OAuth credentials in `~/.claude/.credentials.json`; ordinary `sk-` API keys do not authenticate this endpoint; local pi logs provide fallback activity |
+| **Copilot** | Quota information from `/copilot_internal/user` | `GITHUB_TOKEN`, `GH_TOKEN`, or the token in `~/.config/gh/hosts.yml` |
+| **z.ai** | Quota windows from `/api/monitor/usage/quota/limit`; rate-limit header probe | `ZAI_API_KEY`; falls back to local pi usage against configured `ZAI_LIMIT_*` caps |
+| **OpenRouter** | Key usage and credits from `/api/v1/key` and `/api/v1/credits` | `OPENROUTER_API_KEY`; optional spending budgets |
+| **DeepSeek** | Account balance from `/user/balance` | `DEEPSEEK_API_KEY`; local pi activity alongside the lifetime balance |
+| **Strata** | Engine status, model, context, and queue from `/status` and `/v1/models` | `STRATA_BASE_URL` (default `http://127.0.0.1:8081`); local pi activity |
+| **Ollama** | Loaded models and VRAM from `/api/ps` | `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434`); local pi activity |
+| **Other names** | Local session accounting | Matching provider entries under `PI_SESSION_DIR`; totals and throughput without artificial quota bars |
 
-Every window with a known start prints its pace next to the bar: usage is compared with
-the share of the window already elapsed, and labelled `pace ahead / on track / behind`
-using `PACE_TRIGGER` (10 by default). A window that started 50% ago at 20% usage is
-`pace ahead 30%` — you are burning the quota slower than the clock.
+Provider endpoints can change or reject credentials. Check each panel's source and error information: local estimates and cached snapshots do not prove that a server quota is available. Each HTTP request has a 10-second timeout; providers are fetched concurrently.
 
-Windows are only known when the provider reports them (`resets_at` / `resets_at_seconds`)
-or when local logs can infer the first request in the window.
+### Understanding the numbers
 
-## Config
+- **Live quotas vs. estimates:** z.ai uses server-reported quota rows when available. Its fallback bars compare locally recorded tokens with your assumed caps. An “over assumed cap” label may mean the configured cap is wrong.
+- **Coverage:** local accounting only includes recorded sessions. Activity through other clients is invisible unless it appears in those logs.
+- **Throughput:** pi output tokens are divided by the parent-to-assistant timestamp gap, excluding intervening tool execution. These timestamps do not isolate model decoding from prefill or other request overhead.
+- **Pricing:** local cost estimates use OpenRouter model pricing, cached in `~/.cache/aitop/pricing.json` for 24 hours by default. Estimates are not invoices.
+- **Pace:** where a window start is known, usage is compared with elapsed time. At 20% usage halfway through a window, `pace ahead 30%` means usage is below the elapsed share. `PACE_TRIGGER` controls the threshold.
+- **Balances:** DeepSeek balance and OpenRouter credits are lifetime account balances, not rolling quotas. OpenRouter calendar pace uses configured budgets.
+- **Cap changes:** observed caps persist in `limits.json`; a change is reported on the next run. JSON rows also expose `cap`.
 
-Lookup order: `AITOP_ENV` → `./.env` → `~/.config/aitop/.env` → project `.env`.
-`install.sh` seeds `~/.config/aitop/.env` (chmod 600) from the project `.env` if it exists, otherwise from `.env.example`.
+## Configuration
 
-| var | meaning |
-|-----|---------|
-| `REFRESH_SECONDS` | TUI refresh interval (default 5) |
-| `CODEX_AUTH_FILE` | path to `~/.codex/auth.json` (or set `CODEX_ACCESS_TOKEN`) |
-| `CODEX_BASE_URL` | default `https://chatgpt.com/backend-api` |
-| `CODEX_INSTALLATION_ID` | sent as `x-codex-installation-id`; auto-read from `~/.codex/installation_id` |
-| `CLAUDE_CREDENTIALS_FILE` | path to `~/.claude/.credentials.json` (OAuth creds; `sk-` keys are not accepted by the usage endpoint — without them the row falls back to local accounting) |
-| `ANTHROPIC_BASE_URL` | default `https://api.anthropic.com` |
-| `GITHUB_TOKEN` | copilot token; falls back to `gh`'s stored token |
-| `GITHUB_API_BASE_URL` | default `https://api.github.com` |
-| `ZAI_API_KEY` / `ZAI_BASE_URL` | z.ai key + `https://api.z.ai/api/coding/paas/v4` |
-| `ZAI_LIMIT_5H` / `ZAI_LIMIT_DAY` / `ZAI_LIMIT_WEEK` / `ZAI_LIMIT_RPM` | assumed caps for the local z.ai accounting — tune to your plan; usage above a cap is clamped to 100% and flagged as "over assumed cap", it is a wrong guess, not an exhausted quota |
-| `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` | OpenRouter key + base |
-| `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | DeepSeek key + default `https://api.deepseek.com` |
-| `OR_BUDGET_DAY` / `OR_BUDGET_WEEK` / `OR_BUDGET_MONTH` | optional daily/weekly/monthly spending budgets (USD); pace on OpenRouter calendar rows is computed against these, not against your lifetime balance |
-| `CODEX_SESSION_DIR` / `PI_SESSION_DIR` | local session-log directories used for the 24h sparkline and local accounting |
-| `AITOP_CACHE_DIR` | `~/.cache/aitop` — panel snapshots, pricing cache and `limits.json`, created 0700, files 0600 |
-| `PRICING_CACHE_HOURS` | pricing cache TTL (default 24) |
-| `PACE_TRIGGER` | pace ahead/behind threshold (default 10) |
-| `AITOP_REDACT` | `1` hides email + key prefixes (same as `--redact`) |
-| `PROVIDERS` | comma-separated panel list and order (default `codex,deepseek,z.ai,openrouter`) |
+Existing environment variables take precedence over dotenv values. File selection is: `AITOP_ENV` when set; otherwise `.env` in the current directory or a parent; then `~/.config/aitop/.env`; finally the source directory's `.env` in debug builds only.
 
-The Codex usage endpoint returns `403` without a `codex_cli_rs/*` User-Agent, so the client sends one.
+See [`.env.example`](.env.example) for a starting configuration. Use absolute paths or `${HOME}` in dotenv path values; literal `~` is not expanded by the application.
 
-## Notes
+| Variable | Purpose / default |
+| --- | --- |
+| `PROVIDERS` | Panel order; `codex,deepseek,z.ai,openrouter` |
+| `REFRESH_SECONDS` | Dashboard refresh interval; `5` |
+| `AITOP_REDACT` | Hide account email and key prefixes; `1` enables |
+| `AITOP_HISTORY` | Use seven daily sparkline buckets; `1` enables |
+| `CODEX_AUTH_FILE` / `CODEX_ACCESS_TOKEN` | Override Codex credential file or access token |
+| `CODEX_BASE_URL` | `https://chatgpt.com/backend-api` |
+| `CODEX_INSTALLATION_ID` | Override ID normally read from `~/.codex/installation_id` |
+| `CLAUDE_CREDENTIALS_FILE` | Override Claude Code OAuth credential file |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
+| `GITHUB_TOKEN` / `GH_TOKEN` | Copilot authentication |
+| `GITHUB_API_BASE_URL` | `https://api.github.com` |
+| `ZAI_API_KEY` / `ZAI_BASE_URL` | Key and base; `https://api.z.ai/api/coding/paas/v4` |
+| `ZAI_LIMIT_5H` / `DAY` / `WEEK` / `MONTH` / `RPM` | Local fallback caps (each uses the `ZAI_LIMIT_` prefix); defaults `200000` / `1000000` / `5000000` / `0` / `30` |
+| `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` | Key and base; `https://openrouter.ai/api/v1` |
+| `OR_BUDGET_DAY` / `OR_BUDGET_WEEK` / `OR_BUDGET_MONTH` | Optional whole-dollar spending budgets |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | Key and base; `https://api.deepseek.com` |
+| `STRATA_BASE_URL` / `OLLAMA_BASE_URL` | Local engine addresses; see provider table |
+| `CODEX_SESSION_DIR` / `PI_SESSION_DIR` | Log roots; `~/.codex/sessions` / `~/.pi/agent/sessions` |
+| `AITOP_CACHE_DIR` | Cache location; `~/.cache/aitop` |
+| `PRICING_CACHE_HOURS` | Pricing cache lifetime; `24` |
+| `PACE_TRIGGER` | Pace threshold in percentage points; `10` |
 
-- z.ai bars are **estimates**: they are local token accounting against limits you configure, not server-reported quotas.
-- Local accounting only counts what is written to the session logs; anything done through other tools/clients is invisible.
-- `tok/s` is output tokens divided by the parent→assistant timestamp gap in the session logs.
-  It measures generation only: prefill time is not separable from the logs, so the number is an
-  upper bound on end-to-end throughput.
-- Secrets are never printed — only a masked key prefix.
-- `--json` includes the account email when a provider reports one (it is already in your
-  local credential files and in the TUI panel header). Pipe it to a file or use `--redact`
-  if you do not want identity in the output.
-- `--json` is a single snapshot unless you pass `--watch N`; nothing is written to stdout
-  by the refresh thread itself.
-- Caps in use are remembered per provider/window in `~/.cache/aitop/limits.json`. When a cap
-  changes between runs (you tune `ZAI_LIMIT_*`, or a plan changes), the panel prints
-  `cap 5.00M → 10.00M (first seen …)` once. `--json` rows carry `cap` for the same reason.
-- z.ai: the quota endpoint `https://api.z.ai/api/monitor/usage/quota/limit` (same path on
-  `open.bigmodel.cn`) answers with exact quota windows (`CREDIT_LIMIT`/`TOKENS_LIMIT`,
-  unit 3 = 5h rolling, unit 6 = weekly) for the `ZAI_API_KEY` Bearer token. When it answers,
-  the z.ai panel shows those live rows; otherwise it falls back to local session accounting
-  against `ZAI_LIMIT_*`.
+## Privacy
+
+Keep API keys in environment variables or an untracked `.env` file. The dashboard normally displays account email and a four-character key prefix; use `--redact` or `AITOP_REDACT=1` before sharing output. Review diagnostics and local paths before posting logs.
+
+Cache directories and files use owner-only permissions on POSIX systems (`0700` / `0600`). Cache content can include account information and refreshed credentials; do not commit it. The local pre-commit hook is not installed by cloning the repository.
+
+## Development
+
+The implementation uses Ratatui, crossterm, synchronous `ureq` requests, and standard-library threads. Panel builders are separated from networking so unit tests use static fixtures.
+
+```bash
+cargo test
+cargo clippy --all-targets -- --deny warnings
+cargo fmt --check
+cargo build --locked
+./target/debug/aitop --render-test
+./target/debug/aitop --render-test --synthetic --size 120x30
+./target/debug/aitop --render-test --synthetic --size 100x30
+./target/debug/aitop --plain
+```
+
+The live render and plain snapshot commands use your configured credentials and endpoints. See [AGENTS.md](AGENTS.md) for architecture and contribution conventions.
