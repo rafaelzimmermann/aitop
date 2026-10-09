@@ -53,8 +53,13 @@ Each provider is `fetch → parse → panel_builder`; the JSON→Panel part is p
       hardcoded `ZAI_LIMIT_*`. Rows carry a `cap` field (also in `--json`); the first sighting
       is silent, a change prints one line per run.
 - [x] z.ai: derive the cap from the live `x-ratelimit-*` headers when the gateway sends
-      them, falling back to `ZAI_LIMIT_*` (`live_limits` in providers.rs; checked 2026-10-09:
-      `api.z.ai` returns no `x-ratelimit-*` headers, so the probe only takes effect if they appear).
+      them, falling back to `ZAI_LIMIT_*` (probe only; api.z.ai sends no such headers).
+      Superseded by: the real quota endpoint `GET {host}/api/monitor/usage/quota/limit`
+      (found via the glm-plan-usage plugins) returns exact 5h/weekly quota rows for the
+      `ZAI_API_KEY` Bearer token; the panel uses it when it answers and falls back to
+      local accounting otherwise. Verified live 2026-10-09: `{"limits":[{"type":"CREDIT_LIMIT",
+      "unit":3,"usage":12000,"currentValue":12,"percentage":1,...},{"type":"CREDIT_LIMIT",
+      "unit":6,"usage":60000,"currentValue":2870,"percentage":4,...}],"level":"pro"}`.
 - [x] optional: `--history` sparkline over 7d instead of 24h (`Stats.daily`, 7 daily buckets,
       exposed as `spark_label` in plain output and `--json`)
 - [x] TUI rows use fixed columns (label 14 · pct 5 · bar 24 · detail) so bars line up across

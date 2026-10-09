@@ -50,7 +50,7 @@ TUI keys: `q` quit · `r` refresh now · `h` help · `1-9` focus provider · `Ta
 | codex      | `GET https://chatgpt.com/backend-api/codex/usage` (OAuth token from `~/.codex/auth.json`) + local `~/.codex/sessions/**/rollout-*.jsonl` (`token_count` events) |
 | claude     | `GET https://api.anthropic.com/api/oauth/usage` (OAuth refresh token from `~/.claude/.credentials.json`, or an `sk-` key) + local pi logs |
 | copilot    | `GET https://api.github.com/copilot_internal/user` (`GITHUB_TOKEN`, `gh` token, or `~/.config/gh/oauth_token`) |
-| z.ai       | **no public quota API** → local accounting from `~/.pi/agent/sessions` (pi assistant messages with `usage`, provider `zai`) compared against configurable `ZAI_LIMIT_*`; plus a live `/models` probe that prints any `x-ratelimit-*` headers the gateway returns |
+| z.ai       | live quota API `GET {host}/api/monitor/usage/quota/limit` (the endpoint the glm-plan-usage plugins use; same Bearer key as `ZAI_API_KEY`) → 5h/weekly quota rows with exact percentages and reset times; falls back to local accounting from `~/.pi/agent/sessions` compared against configurable `ZAI_LIMIT_*` when the endpoint is unavailable; plus a live `/models` probe that prints any `x-ratelimit-*` headers the gateway returns |
 | openrouter | `GET https://openrouter.ai/api/v1/key` and `/api/v1/credits`     |
 | any other  | no quota API → local session logs (`PROVIDERS=ollama,strata`), reported as totals plus output tok/s (generation time measured from each assistant message to its parent) |
 
@@ -111,3 +111,8 @@ The Codex usage endpoint returns `403` without a `codex_cli_rs/*` User-Agent, so
 - Caps in use are remembered per provider/window in `~/.cache/aitop/limits.json`. When a cap
   changes between runs (you tune `ZAI_LIMIT_*`, or a plan changes), the panel prints
   `cap 5.00M → 10.00M (first seen …)` once. `--json` rows carry `cap` for the same reason.
+- z.ai: the quota endpoint `https://api.z.ai/api/monitor/usage/quota/limit` (same path on
+  `open.bigmodel.cn`) answers with exact quota windows (`CREDIT_LIMIT`/`TOKENS_LIMIT`,
+  unit 3 = 5h rolling, unit 6 = weekly) for the `ZAI_API_KEY` Bearer token. When it answers,
+  the z.ai panel shows those live rows; otherwise it falls back to local session accounting
+  against `ZAI_LIMIT_*`.

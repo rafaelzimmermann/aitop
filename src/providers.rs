@@ -679,11 +679,29 @@ pub fn copilot(cfg: &Config, _pricing: &Pricing) -> Panel {
 
 // ---------------------------------------------------------------- z.ai
 
-fn zai_panel(cfg: &Config, stats: &local::Stats, probe_lines: &[String]) -> Panel {
+fn zai_panel(
+    cfg: &Config,
+    stats: &local::Stats,
+    probe_lines: &[String],
+    quota: Option<&Value>,
+) -> Panel {
     let mut p = Panel::new("z.ai");
-    p.source = Some("local accounting (no public quota API)".into());
+    let q = quota.and_then(quota_limits);
+    p.source = Some(if q.is_some() {
+        "live quota API".into()
+    } else {
+        "local accounting (no public quota API)".into()
+    });
     p.subtitle = match &cfg.zai_key {
-        Some(k) => format!("key {} · local accounting", mask_key(cfg, k)),
+        Some(k) => format!(
+            "key {} · {}",
+            mask_key(cfg, k),
+            if q.is_some() {
+                "live quota"
+            } else {
+                "local accounting"
+            },
+        ),
         None => "no key (set ZAI_API_KEY)".to_string(),
     };
 
@@ -716,27 +734,33 @@ fn zai_panel(cfg: &Config, stats: &local::Stats, probe_lines: &[String]) -> Pane
             cfg.zai_limits.rpm
         },
     };
-    add_local_rows(&mut p, cfg, stats, &caps);
+    if let Some(q) = q.as_ref() {
+        add_quota_rows(&mut p, q);
+    } else {
+        add_local_rows(&mut p, cfg, stats, &caps);
+    }
     // usage above an assumed cap almost always means the cap guess is wrong, not that
     // the plan is exhausted; say so instead of showing a 600% bar
-    let over = [
-        ("5h", stats.tokens_5h, caps.five_hour),
-        ("daily", stats.tokens_24h, caps.day),
-        ("weekly", stats.tokens_7d, caps.week),
-    ]
-    .iter()
-    .filter(|(_, used, cap)| *cap > 0 && *used > *cap)
-    .map(|(w, used, cap)| {
-        format!(
-            "over assumed cap in {} ({} > {}) — tune ZAI_LIMIT_* to your plan",
-            w,
-            fmt_tokens(*used),
-            fmt_tokens(*cap),
-        )
-    })
-    .collect::<Vec<String>>();
-    if !over.is_empty() {
-        p.lines.push(over.join(" · "));
+    if q.is_none() {
+        let over = [
+            ("5h", stats.tokens_5h, caps.five_hour),
+            ("daily", stats.tokens_24h, caps.day),
+            ("weekly", stats.tokens_7d, caps.week),
+        ]
+        .iter()
+        .filter(|(_, used, cap)| *cap > 0 && *used > *cap)
+        .map(|(w, used, cap)| {
+            format!(
+                "over assumed cap in {} ({} > {}) — tune ZAI_LIMIT_* to your plan",
+                w,
+                fmt_tokens(*used),
+                fmt_tokens(*cap),
+            )
+        })
+        .collect::<Vec<String>>();
+        if !over.is_empty() {
+            p.lines.push(over.join(" · "));
+        }
     }
     for l in probe_lines {
         p.lines.push(l.clone());
@@ -768,6 +792,86 @@ fn live_limits(probe_lines: &[String]) -> Limits {
     }
 }
 
+/// The GLM quota endpoint (see the glm-plan-usage plugins): same host as the
+/// configured base, `/monitor/usage/quota/limit` under `/api`. For z.ai that is
+/// `https://api.z.ai/api/monitor/usage/quota/limit`; for bigmodel.cn,
+/// `https://open.bigmodel.cn/api/monitor/usage/quota/limit`.
+fn quota_url(cfg: &Config) -> String {
+    let base = cfg.zai_base.trim_end_matches('/');
+    let host = base
+        .split("//")
+        .last()
+        .unwrap_or("")
+        .split("/")
+        .next()
+        .unwrap_or(base);
+    format!("https://{host}/api/monitor/usage/quota/limit")
+}
+
+/// Rows from the GLM `/monitor/usage/quota/limit` response. Each entry in
+/// `data.limits` is a quota window: TOKENS_LIMIT unit=3 → 5h rolling,
+/// unit=6 → weekly; TIME_LIMIT → MCP/tool call quota. The API gives the
+/// percentage directly, so no pace guesswork is needed.
+fn quota_limits(v: &Value) -> Option<Vec<&Value>> {
+    if v.get("success").and_then(|x| x.as_bool()) == Some(false) {
+        return None;
+    }
+    v.get("data")
+        .and_then(|d| d.get("limits"))
+        .and_then(|l| l.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|x| x.get("type").map(|t| t.is_string()).unwrap_or(false))
+                .collect::<Vec<&Value>>()
+        })
+}
+
+fn add_quota_rows(p: &mut Panel, limits: &[&Value]) {
+    for l in limits {
+        let typ = l.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let unit = l.get("unit").and_then(|u| u.as_i64()).unwrap_or(0);
+        let pct = l
+            .get("percentage")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0);
+        let label = match (typ, unit) {
+            ("TOKENS_LIMIT", 3) => Some("5h window".to_string()),
+            ("TOKENS_LIMIT", 6) => Some("weekly".to_string()),
+            ("CREDIT_LIMIT", 3) => Some("5h window".to_string()),
+            ("CREDIT_LIMIT", 6) => Some("weekly".to_string()),
+            ("TIME_LIMIT", _) => Some("mcp calls".to_string()),
+            (_, _) => None,
+        };
+        let label = match label {
+            Some(s) => s,
+            None => continue,
+        };
+        let used = l
+            .get("currentValue")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let total = l.get("usage").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let detail = if total > 0.0 {
+            format!("{} / {}", fmt_tokens(used as u64), fmt_tokens(total as u64))
+        } else {
+            format!("{pct:.0}% used")
+        };
+        let mut r = Row::new(&label, pct, detail);
+        if total > 0.0 {
+            r.set_cap(&fmt_tokens(total as u64));
+        }
+        if let Some(ms) = l.get("nextResetTime").and_then(|x| x.as_f64()) {
+            let secs = (ms / 1000.0) as u64;
+            let now = Utc::now().timestamp() as u64;
+            if secs > now {
+                r.pace = Some(format!("resets in {}", fmt_duration(secs - now)))
+            }
+        }
+        p.rows.push(r);
+    }
+}
+
 /// Providers with no quota API: everything comes from the local session logs. Bars only
 /// appear when a cap is configured for them, otherwise the panel is totals + throughput.
 fn local_panel(cfg: &Config, name: &str, stats: &local::Stats) -> Panel {
@@ -782,7 +886,29 @@ fn local_panel(cfg: &Config, name: &str, stats: &local::Stats) -> Panel {
 pub fn zai(cfg: &Config, pricing: &Pricing) -> Panel {
     let stats = local::pi_usage(&cfg.pi_session_dir, "zai", pricing);
     let mut probe_lines = Vec::new();
-    if let Some(k) = &cfg.zai_key {
+    let quota: Option<Value> = if let Some(k) = &cfg.zai_key {
+        let url = quota_url(cfg);
+        let q = match request(&url, Some(k), &[], None) {
+            Ok(resp) => match resp.into_json::<Value>() {
+                Ok(j) => {
+                    let ok = j.get("success").and_then(|x| x.as_bool()).unwrap_or(true);
+                    if !ok {
+                        let msg = j.get("msg").and_then(|m| m.as_str()).unwrap_or("failed");
+                        probe_lines.push(format!("quota API: {msg}"));
+                    }
+                    Some(j)
+                }
+                Err(e) => {
+                    probe_lines.push(format!("quota API parse failed: {e}"));
+                    None
+                }
+            },
+            Err(e) => {
+                probe_lines.push(format!("quota API failed: {e}"));
+                None
+            }
+        };
+        // keep the /models probe: it validates the key and prints any x-ratelimit-* headers
         let url = format!("{}/models", cfg.zai_base.trim_end_matches('/'));
         match request(&url, Some(k), &[], None) {
             Ok(resp) => {
@@ -804,8 +930,11 @@ pub fn zai(cfg: &Config, pricing: &Pricing) -> Panel {
             }
             Err(e) => probe_lines.push(format!("live probe failed: {e}")),
         }
-    }
-    zai_panel(cfg, &stats, &probe_lines)
+        q
+    } else {
+        None
+    };
+    zai_panel(cfg, &stats, &probe_lines, quota.as_ref())
 }
 
 // ---------------------------------------------------------------- OpenRouter
@@ -1275,7 +1404,7 @@ mod tests {
             ..Default::default()
         };
 
-        let p = zai_panel(&cfg, &s, &["x-ratelimit-limit: 30".to_string()]);
+        let p = zai_panel(&cfg, &s, &["x-ratelimit-limit: 30".to_string()], None);
         assert_eq!(p.rows.len(), 4);
         assert_eq!(p.rows[0].pct, 40.0); // 80k of 200k
         assert_eq!(p.rows[0].pace.as_deref(), Some("pace behind 20%")); // 20% expected after 1h
@@ -1307,7 +1436,7 @@ mod tests {
             ..Default::default()
         };
         // rpm cap comes from the live header; day cap falls back to ZAI_LIMIT_DAY
-        let p = zai_panel(&cfg, &s, &["x-ratelimit-limit: 60".to_string()]);
+        let p = zai_panel(&cfg, &s, &["x-ratelimit-limit: 60".to_string()], None);
         assert_eq!(p.rows[3].detail, "12.0 / 60");
         assert_eq!(p.rows[1].cap, Some(fmt_tokens(cfg.zai_limits.day)));
     }
@@ -1322,7 +1451,7 @@ mod tests {
             ..Default::default()
         };
         // 6M of a 5M weekly cap must not render as 600%
-        let p = zai_panel(&cfg, &s, &[]);
+        let p = zai_panel(&cfg, &s, &[], None);
         assert_eq!(p.rows[2].pct, 100.0);
         assert!(p
             .lines
@@ -1331,11 +1460,79 @@ mod tests {
     }
 
     #[test]
+    fn live_quota_api_rows_replace_the_local_bars() {
+        let cfg = test_config();
+        let v: Value = serde_json::json!({
+            "code": 200,
+            "msg": "Success",
+            "success": true,
+            "data": {
+                "limits": [
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 3,
+                        "number": 5,
+                        "percentage": 28,
+                        "nextResetTime": 1771073738808i64
+                    },
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 6,
+                        "usage": 500000,
+                        "currentValue": 120000,
+                        "percentage": 24,
+                        "nextResetTime": null
+                    },
+                    {
+                        "type": "TIME_LIMIT",
+                        "unit": 5,
+                        "number": 1,
+                        "usage": 100,
+                        "currentValue": 28,
+                        "remaining": 72,
+                        "percentage": 28
+                    }
+                ],
+                "level": "lite"
+            }
+        });
+        let p = zai_panel(&cfg, &local::Stats::default(), &[], Some(&v));
+        assert_eq!(p.source, Some("live quota API".to_string()));
+        assert_eq!(p.rows.len(), 3);
+        assert_eq!(p.rows[0].label, "5h window");
+        assert_eq!(p.rows[0].pct, 28.0);
+        assert_eq!(p.rows[0].detail, "28% used"); // no usage field → percentage only
+        assert_eq!(p.rows[1].label, "weekly");
+        assert_eq!(p.rows[1].pct, 24.0);
+        assert_eq!(p.rows[1].detail, "120.0k / 500.0k");
+        assert_eq!(p.rows[1].cap, Some("500.0k".to_string()));
+        assert_eq!(p.rows[2].label, "mcp calls");
+        assert_eq!(p.rows[2].detail, "28 / 100");
+    }
+
+    #[test]
+    fn quota_api_failure_falls_back_to_local_rows() {
+        let cfg = test_config();
+        let v: Value = serde_json::json!({"success": false, "msg": "bad key"});
+        let p = zai_panel(
+            &cfg,
+            &local::Stats::default(),
+            &["quota API: bad key".to_string()],
+            Some(&v),
+        );
+        assert_eq!(
+            p.source,
+            Some("local accounting (no public quota API)".to_string())
+        );
+        assert!(p.lines.iter().any(|l| l == "quota API: bad key"));
+    }
+
+    #[test]
     fn keys_are_masked_in_output() {
         let cfg = test_config();
         let mut c = cfg.clone();
         c.zai_key = Some("3af1bb111111111111111111".into());
-        let p = zai_panel(&c, &local::Stats::default(), &[]);
+        let p = zai_panel(&c, &local::Stats::default(), &[], None);
         assert_eq!(p.subtitle, "key 3af1… · local accounting");
         assert!(!p.subtitle.contains("111111111111111111"));
     }
@@ -1359,7 +1556,7 @@ mod tests {
         cfg.redact = true;
         cfg.zai_key = Some("3af1deadbeefdeadbeef".into());
         assert_eq!(
-            zai_panel(&cfg, &local::Stats::default(), &[]).subtitle,
+            zai_panel(&cfg, &local::Stats::default(), &[], None).subtitle,
             "key [redacted] · local accounting"
         );
 
@@ -1433,7 +1630,7 @@ mod tests {
             .any(|l| l.contains("gemma4:26b") && l.contains("· 50 tok/s")));
 
         // z.ai keeps its bars because ZAI_LIMIT_* is configured
-        let z = zai_panel(&cfg, &stats, &[]);
+        let z = zai_panel(&cfg, &stats, &[], None);
         assert_eq!(z.rows.len(), 4);
         assert!(z.lines.iter().any(|l| l.contains("output tok/s")));
     }
