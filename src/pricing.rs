@@ -7,6 +7,8 @@ use crate::util;
 
 const UA: &str = "aitop/0.1 (+https://github.com/; htop-for-ai-usage)";
 
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 pub struct Price {
     pub prompt: f64,
@@ -140,6 +142,7 @@ pub fn load(cache_dir: &Path, base: &str, max_age_hours: i64) -> Pricing {
 
     let url = format!("{}/models", base.trim_end_matches('/'));
     match ureq::get(&url)
+        .timeout(TIMEOUT)
         .set("User-Agent", UA)
         .set("accept", "application/json")
         .call()

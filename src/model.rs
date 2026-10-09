@@ -1,3 +1,22 @@
+/// Filled and empty cells of a fixed-width bar (pct is clamped to 0..100).
+pub fn bar_parts(pct: f64, width: usize) -> (usize, usize) {
+    let filled = ((pct / 100.0).clamp(0.0, 1.0) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    (filled, width - filled)
+}
+
+pub fn ascii_bar(pct: f64, width: usize) -> String {
+    let (filled, empty) = bar_parts(pct, width);
+    let mut s = String::new();
+    for _ in 0..filled {
+        s.push('█');
+    }
+    for _ in 0..empty {
+        s.push('░');
+    }
+    s
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Row {
     pub label: String,
@@ -128,6 +147,16 @@ mod tests {
         assert_eq!(window_label(86400), "24h window");
         assert_eq!(window_label(604800), "7d window");
         assert_eq!(window_label(2592000), "4w window");
+    }
+
+    #[test]
+    fn bar_parts_and_ascii_bar() {
+        assert_eq!(bar_parts(0.0, 10), (0, 10));
+        assert_eq!(bar_parts(50.0, 10), (5, 5));
+        assert_eq!(bar_parts(150.0, 10), (10, 0)); // clamped
+        assert_eq!(bar_parts(-5.0, 10), (0, 10)); // clamped
+        assert_eq!(ascii_bar(50.0, 10), "█████░░░░░");
+        assert_eq!(ascii_bar(150.0, 10), "██████████");
     }
 
     #[test]

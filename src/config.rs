@@ -2,11 +2,12 @@ use std::path::{Path, PathBuf};
 
 /// Rolling-window token limits (z.ai exposes no public quota API, so these are
 /// user-configurable and used purely for local accounting bars).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Limits {
     pub five_hour: u64,
     pub day: u64,
     pub week: u64,
+    pub month: u64,
     pub rpm: u64,
 }
 
@@ -43,6 +44,9 @@ pub struct Config {
     pub pi_session_dir: PathBuf,
 
     pub zai_limits: Limits,
+    /// optional openrouter spending budgets; pace only makes sense against a budget,
+    /// not against a lifetime balance
+    pub budget: Limits,
 
     pub pace_trigger: f64,
     pub pricing_max_age_hours: i64,
@@ -121,7 +125,8 @@ pub fn load() -> Config {
         let xdg = home().join(".config/aitop/.env");
         if xdg.exists() {
             let _ = dotenvy::from_filename(&xdg);
-        } else {
+        } else if cfg!(debug_assertions) {
+            // dev convenience only; a release binary must not embed the build machine path
             let _ = dotenvy::from_filename(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env"));
         }
     }
@@ -187,7 +192,16 @@ pub fn load() -> Config {
             five_hour: env_num("ZAI_LIMIT_5H", 200_000),
             day: env_num("ZAI_LIMIT_DAY", 1_000_000),
             week: env_num("ZAI_LIMIT_WEEK", 5_000_000),
+            month: env_num("ZAI_LIMIT_MONTH", 0),
             rpm: env_num("ZAI_LIMIT_RPM", 30),
+        },
+
+        budget: Limits {
+            five_hour: env_num("OR_BUDGET_5H", 0),
+            day: env_num("OR_BUDGET_DAY", 0),
+            week: env_num("OR_BUDGET_WEEK", 0),
+            month: env_num("OR_BUDGET_MONTH", 0),
+            rpm: env_num("OR_BUDGET_RPM", 0),
         },
 
         pace_trigger: env_float("PACE_TRIGGER", 10.0),
@@ -249,11 +263,13 @@ pub fn test_config() -> Config {
             five_hour: 200_000,
             day: 1_000_000,
             week: 5_000_000,
+            month: 0,
             rpm: 30,
         },
         pace_trigger: 10.0,
         pricing_max_age_hours: 24,
         providers: vec!["codex".into()],
+        budget: Limits::default(),
     }
 }
 

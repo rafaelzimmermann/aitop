@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::pricing::Pricing;
 
@@ -9,7 +10,10 @@ pub struct ModelStat {
     pub model: String,
     pub requests: u64,
     pub tokens: u64,
+    pub output: u64,
+    pub secs: f64,
     pub cost: f64,
+    pub tps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -25,6 +29,12 @@ pub struct Stats {
     pub daily: Vec<u64>, // last 7 daily buckets, oldest first
     pub cost_total: f64,
     pub cost_24h: f64,
+    /// output tokens generated inside the 24h window
+    pub output_24h: u64,
+    /// generation time measured inside the 24h window
+    pub secs_24h: f64,
+    pub tps_24h: Option<f64>,
+    pub last_tps: Option<f64>,
     pub models: Vec<ModelStat>,
     pub first_5h: Option<DateTime<Utc>>,
     pub first_24h: Option<DateTime<Utc>>,
@@ -35,16 +45,22 @@ pub struct Stats {
 pub struct Event {
     pub ts: DateTime<Utc>,
     pub tokens: u64,
+    pub output: u64,
+    /// generation time in seconds; 0.0 when the log has no usable parent entry
+    pub secs: f64,
     pub cost: f64,
     pub model: String,
 }
 
-fn collect(events: &[Event]) -> Stats {
+pub fn collect(events: &[Event]) -> Stats {
     let now = Utc::now();
     let mut s = Stats::default();
     let mut buckets = vec![0u64; 24];
     let mut daily = vec![0u64; 7];
     let mut newest: Option<DateTime<Utc>> = None;
+    let mut newest_tps: Option<(DateTime<Utc>, f64)> = None;
+    let mut out24 = 0u64;
+    let mut secs24 = 0.0f64;
     let mut models: BTreeMap<String, ModelStat> = BTreeMap::new();
 
     for e in events {
@@ -60,6 +76,10 @@ fn collect(events: &[Event]) -> Stats {
         if e.ts > now - Duration::hours(24) {
             s.tokens_24h += e.tokens;
             s.cost_24h += e.cost;
+            if e.output > 0 && e.secs > 0.0 {
+                out24 += e.output;
+                secs24 += e.secs;
+            }
             s.first_24h = Some(s.first_24h.map(|f| e.ts.min(f)).unwrap_or(e.ts));
         }
         if e.ts > now - Duration::days(7) {
@@ -75,15 +95,43 @@ fn collect(events: &[Event]) -> Stats {
             newest = Some(e.ts);
         }
 
+        if e.output > 0 && e.secs > 0.0 {
+            let tps = e.output as f64 / e.secs;
+            if newest_tps.map(|(t, _)| e.ts > t).unwrap_or(true) {
+                newest_tps = Some((e.ts, tps));
+            }
+        }
+
         let key = if e.model.is_empty() {
             "unknown".to_string()
         } else {
             e.model.clone()
         };
-        let m = models.entry(key).or_default();
+        let m = models.entry(key.clone()).or_default();
+        if m.model.is_empty() {
+            m.model = key;
+        }
         m.requests += 1;
         m.tokens += e.tokens;
+        m.output += e.output;
+        m.secs += e.secs;
         m.cost += e.cost;
+    }
+
+    s.output_24h = out24;
+    s.secs_24h = secs24;
+    s.tps_24h = if secs24 > 0.0 {
+        Some(out24 as f64 / secs24)
+    } else {
+        None
+    };
+    s.last_tps = newest_tps.map(|(_, v)| v);
+    for m in models.values_mut() {
+        m.tps = if m.secs > 0.0 {
+            Some(m.output as f64 / m.secs)
+        } else {
+            None
+        };
     }
 
     s.last_request = newest.map(|t| t.to_rfc3339());
@@ -94,17 +142,36 @@ fn collect(events: &[Event]) -> Stats {
     s
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Collect .jsonl session files modified within `max_age` (the largest window we
+/// account over), so a growing archive of old sessions is never re-read.
+fn walk(dir: &Path, out: &mut Vec<PathBuf>, max_age: std::time::Duration) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
-                walk(&p, out);
+                walk(&p, out, max_age);
             } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                out.push(p);
+                let fresh = match e.metadata().and_then(|m| m.modified()) {
+                    Ok(t) => match SystemTime::now().duration_since(t) {
+                        Ok(age) => age <= max_age,
+                        Err(_) => true, // mtime in the future: keep it
+                    },
+                    Err(_) => true, // no mtime available: keep it
+                };
+                if fresh {
+                    out.push(p);
+                }
             }
         }
     }
+}
+
+/// Largest window `collect` buckets over is 7 days; keep a margin for clock skew.
+fn walk_all(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    walk(dir, &mut files, std::time::Duration::from_secs(10 * 86400));
+    files.sort();
+    files
 }
 
 fn ts(v: &serde_json::Value) -> Option<DateTime<Utc>> {
@@ -114,8 +181,74 @@ fn ts(v: &serde_json::Value) -> Option<DateTime<Utc>> {
         .map(|t| t.to_utc())
 }
 
+#[derive(Debug)]
+struct Entry {
+    role: String,
+    ts: DateTime<Utc>,
+}
+
+/// id -> entry, so an assistant message can be timed against the entry that triggered it.
+fn index(raw: &str) -> BTreeMap<String, Entry> {
+    let mut out = BTreeMap::new();
+    for line in raw.lines() {
+        let d: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if d.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let t = match ts(&d) {
+            Some(t) => t,
+            None => continue,
+        };
+        let id = match d.get("id").and_then(|i| i.as_str()) {
+            Some(i) => i.to_string(),
+            None => continue,
+        };
+        out.insert(
+            id,
+            Entry {
+                role: d
+                    .get("message")
+                    .and_then(|m| m.get("role"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                ts: t,
+            },
+        );
+    }
+    out
+}
+
+/// Generation time: the gap between the entry that triggered the call (a user message or
+/// a tool result) and the assistant reply. Assistant parents are chained replies, so the
+/// gap there includes tool execution and is not generation time.
+fn generation_secs(index: &BTreeMap<String, Entry>, d: &serde_json::Value) -> f64 {
+    let own = match ts(d) {
+        Some(t) => t,
+        None => return 0.0,
+    };
+    let parent = match d
+        .get("parentId")
+        .and_then(|p| p.as_str())
+        .and_then(|p| index.get(p))
+    {
+        Some(e) if e.role == "user" || e.role == "toolResult" => e,
+        _ => return 0.0,
+    };
+    let secs = (own - parent.ts).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
+    if secs > 0.0 {
+        secs
+    } else {
+        0.0
+    }
+}
+
 /// pi session logs: assistant messages carry per-request usage with provider tag.
 pub fn pi_events(raw: &str, provider: &str, pricing: &Pricing) -> Vec<Event> {
+    let entries = index(raw);
     let mut out = Vec::new();
     for line in raw.lines() {
         let d: serde_json::Value = match serde_json::from_str(line) {
@@ -169,6 +302,8 @@ pub fn pi_events(raw: &str, provider: &str, pricing: &Pricing) -> Vec<Event> {
             out.push(Event {
                 ts: t,
                 tokens,
+                output,
+                secs: generation_secs(&entries, &d),
                 cost,
                 model,
             });
@@ -178,8 +313,7 @@ pub fn pi_events(raw: &str, provider: &str, pricing: &Pricing) -> Vec<Event> {
 }
 
 pub fn pi_usage(dir: &Path, provider: &str, pricing: &Pricing) -> Stats {
-    let mut files = Vec::new();
-    walk(dir, &mut files);
+    let files = walk_all(dir);
     let mut events = Vec::new();
     for f in files {
         if let Ok(raw) = std::fs::read_to_string(&f) {
@@ -237,6 +371,9 @@ pub fn codex_events(raw: &str, pricing: &Pricing) -> Vec<Event> {
             out.push(Event {
                 ts: t,
                 tokens,
+                output: num("output_tokens"),
+                // rollout logs record usage, not duration, so throughput is not measurable here
+                secs: 0.0,
                 cost,
                 model,
             });
@@ -246,8 +383,7 @@ pub fn codex_events(raw: &str, pricing: &Pricing) -> Vec<Event> {
 }
 
 pub fn codex_usage(dir: &Path, pricing: &Pricing) -> Stats {
-    let mut files = Vec::new();
-    walk(dir, &mut files);
+    let files = walk_all(dir);
     let mut events = Vec::new();
     for f in files {
         if let Ok(raw) = std::fs::read_to_string(&f) {
@@ -303,30 +439,105 @@ mod tests {
     }
 
     #[test]
-    fn collect_buckets_and_windows() {
+    fn generation_time_comes_from_the_entry_that_triggered_the_call() {
+        let raw = r#"{"type":"message","id":"a","timestamp":"2026-10-09T05:00:00Z","message":{"role":"toolResult","content":[]}}
+{"type":"message","id":"b","parentId":"a","timestamp":"2026-10-09T05:00:10Z","message":{"role":"assistant","provider":"ollama","model":"gemma4:26b","usage":{"input":100,"output":500,"totalTokens":600}}}
+"#;
+        let e = pi_events(raw, "ollama", &Pricing::default());
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].output, 500);
+        assert_eq!(e[0].secs, 10.0);
+    }
+
+    #[test]
+    fn chained_assistant_replies_are_not_generation_time() {
+        let raw = r#"{"type":"message","id":"a","timestamp":"2026-10-09T05:00:00Z","message":{"role":"assistant","provider":"ollama","usage":{"output":10}}}
+{"type":"message","id":"b","parentId":"a","timestamp":"2026-10-09T05:00:10Z","message":{"role":"assistant","provider":"ollama","usage":{"output":500}}}
+"#;
+        let e = pi_events(raw, "ollama", &Pricing::default());
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[1].secs, 0.0);
+    }
+
+    #[test]
+    fn throughput_is_output_tokens_over_generation_time() {
         let now = Utc::now();
         let events = vec![
             Event {
-                ts: now - Duration::minutes(30),
-                tokens: 100,
+                ts: now - Duration::minutes(10),
+                tokens: 600,
+                output: 500,
+                secs: 10.0,
                 cost: 0.0,
                 model: "m".into(),
             },
             Event {
-                ts: now - Duration::hours(10),
-                tokens: 200,
+                ts: now - Duration::hours(2),
+                tokens: 300,
+                output: 200,
+                secs: 20.0,
                 cost: 0.0,
                 model: "m".into(),
             },
             Event {
                 ts: now - Duration::days(3),
                 tokens: 400,
+                output: 300,
+                secs: 30.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+        ];
+        let s = collect(&events);
+        assert_eq!(s.output_24h, 700); // the 3-day-old event is outside the window
+        assert_eq!(s.secs_24h, 30.0);
+        assert!((s.tps_24h.unwrap() - 23.333333333333332).abs() < 1e-9);
+        assert_eq!(s.last_tps, Some(50.0)); // most recent event: 500 output / 10s
+        assert!((s.models[0].tps.unwrap() - 16.666666666666668).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_throughput_without_measured_generation_time() {
+        let raw = r#"{"type":"message","timestamp":"2026-10-09T05:00:00Z","message":{"role":"assistant","provider":"zai","usage":{"output":500}}}"#;
+        let s = collect(&pi_events(raw, "zai", &Pricing::default()));
+        assert_eq!(s.tps_24h, None);
+        assert_eq!(s.last_tps, None);
+        assert_eq!(s.models[0].tps, None);
+    }
+
+    #[test]
+    fn collect_buckets_and_windows() {
+        let now = Utc::now();
+        let events = vec![
+            Event {
+                ts: now - Duration::minutes(30),
+                tokens: 100,
+                output: 0,
+                secs: 0.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::hours(10),
+                tokens: 200,
+                output: 0,
+                secs: 0.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::days(3),
+                tokens: 400,
+                output: 0,
+                secs: 0.0,
                 cost: 0.0,
                 model: "m".into(),
             },
             Event {
                 ts: now - Duration::days(30),
                 tokens: 800,
+                output: 0,
+                secs: 0.0,
                 cost: 0.0,
                 model: "m".into(),
             },
@@ -350,5 +561,43 @@ mod tests {
             events[0].ts.to_rfc3339().as_str()
         );
         assert_eq!(s.models[0].requests, 4);
+    }
+
+    #[test]
+    fn throughput_uses_output_tokens_over_generation_time() {
+        let now = Utc::now();
+        let events = vec![
+            Event {
+                ts: now - Duration::hours(2),
+                tokens: 1000,
+                output: 600,
+                secs: 20.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            Event {
+                ts: now - Duration::hours(3),
+                tokens: 500,
+                output: 400,
+                secs: 10.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+            // outside the 24h window: counted for the model, not for the 24h mean
+            Event {
+                ts: now - Duration::days(30),
+                tokens: 900,
+                output: 900,
+                secs: 9.0,
+                cost: 0.0,
+                model: "m".into(),
+            },
+        ];
+        let s = collect(&events);
+        assert_eq!(s.output_24h, 1000);
+        assert_eq!(s.secs_24h, 30.0);
+        assert_eq!(s.tps_24h, Some(1000.0 / 30.0));
+        assert_eq!(s.last_tps, Some(30.0)); // newest event: 600 / 20
+        assert_eq!(s.models[0].tps, Some(1900.0 / 39.0));
     }
 }

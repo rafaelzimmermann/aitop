@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde_json::Value;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Limits};
 use crate::history;
 use crate::local;
 use crate::model::{fmt_duration, fmt_money, fmt_tokens, window_label, Panel, Row, Snapshot};
@@ -12,6 +12,9 @@ use crate::pricing::Pricing;
 use crate::util;
 
 const UA: &str = "aitop/0.1 (+https://github.com/; htop-for-ai-usage)";
+
+/// A hung provider must not stall a refresh tick, so every request is bounded.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Only the first few characters of a key ever reach the screen / --json.
 fn mask_key(cfg: &Config, k: &str) -> String {
@@ -64,7 +67,10 @@ fn request(
     } else {
         ureq::get(url)
     };
-    req = req.set("User-Agent", UA).set("accept", "application/json");
+    req = req
+        .timeout(TIMEOUT)
+        .set("User-Agent", UA)
+        .set("accept", "application/json");
     if let Some(k) = key {
         req = req.set("Authorization", &format!("Bearer {k}"));
     }
@@ -99,8 +105,7 @@ fn add_row(p: &mut Panel, cfg: &Config, mut r: Row, window_secs: u64, reset_afte
     p.rows.push(r);
 }
 
-fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
-    let l = &cfg.zai_limits;
+fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats, l: &Limits) {
     let pct = |used: u64, limit: u64| {
         if limit > 0 {
             (used as f64 / limit as f64) * 100.0
@@ -114,51 +119,49 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
             .unwrap_or(0)
     };
 
-    let mut r = Row::new(
+    // a row with no cap is still useful: it shows the measured value against the pace
+    let mut push =
+        |label: &str, used: u64, limit: u64, window_secs: u64, start: &Option<DateTime<Utc>>| {
+            let mut r = Row::new(
+                label,
+                pct(used, limit),
+                format!("{} / {}", fmt_tokens(used), fmt_tokens(limit)),
+            );
+            if limit > 0 {
+                r.set_cap(&fmt_tokens(limit));
+            }
+            // pace only means something against a cap
+            if limit > 0 {
+                if let Some(pa) =
+                    pace::assess_elapsed(elapsed(start), window_secs, r.pct, cfg.pace_trigger)
+                {
+                    r.pace = Some(pace::label(&pa));
+                }
+            }
+            p.rows.push(r);
+        };
+
+    push(
         "5h window",
-        pct(stats.tokens_5h, l.five_hour),
-        format!(
-            "{} / {}",
-            fmt_tokens(stats.tokens_5h),
-            fmt_tokens(l.five_hour)
-        ),
+        stats.tokens_5h,
+        l.five_hour,
+        5 * 3600,
+        &stats.first_5h,
     );
-    r.set_cap(&fmt_tokens(l.five_hour));
-    if let Some(pa) =
-        pace::assess_elapsed(elapsed(&stats.first_5h), 5 * 3600, r.pct, cfg.pace_trigger)
-    {
-        r.pace = Some(pace::label(&pa));
-    }
-    p.rows.push(r);
-
-    let mut r = Row::new(
+    push(
         "daily",
-        pct(stats.tokens_24h, l.day),
-        format!("{} / {}", fmt_tokens(stats.tokens_24h), fmt_tokens(l.day)),
-    );
-    r.set_cap(&fmt_tokens(l.day));
-    if let Some(pa) = pace::assess_elapsed(
-        elapsed(&stats.first_24h),
+        stats.tokens_24h,
+        l.day,
         24 * 3600,
-        r.pct,
-        cfg.pace_trigger,
-    ) {
-        r.pace = Some(pace::label(&pa));
-    }
-    p.rows.push(r);
-
-    let mut r = Row::new(
-        "weekly",
-        pct(stats.tokens_7d, l.week),
-        format!("{} / {}", fmt_tokens(stats.tokens_7d), fmt_tokens(l.week)),
+        &stats.first_24h,
     );
-    r.set_cap(&fmt_tokens(l.week));
-    if let Some(pa) =
-        pace::assess_elapsed(elapsed(&stats.first_7d), 7 * 86400, r.pct, cfg.pace_trigger)
-    {
-        r.pace = Some(pace::label(&pa));
-    }
-    p.rows.push(r);
+    push(
+        "weekly",
+        stats.tokens_7d,
+        l.week,
+        7 * 86400,
+        &stats.first_7d,
+    );
 
     let rpm = stats.requests_5h as f64 / 5.0;
     let mut r = Row::new(
@@ -166,7 +169,9 @@ fn add_local_rows(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
         pct(rpm as u64, l.rpm),
         format!("{:.1} / {}", rpm, l.rpm),
     );
-    r.set_cap(&l.rpm.to_string());
+    if l.rpm > 0 {
+        r.set_cap(&l.rpm.to_string());
+    }
     p.rows.push(r);
 }
 
@@ -175,6 +180,14 @@ fn add_local_lines(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
         "requests: {} total · {} in last 5h",
         stats.requests, stats.requests_5h
     ));
+    if let Some(t) = stats.tps_24h {
+        let last = stats
+            .last_tps
+            .map(|v| format!(" · last {:.1}", v))
+            .unwrap_or_default();
+        p.lines
+            .push(format!("output tok/s: {:.1} (24h mean){}", t, last));
+    }
     if stats.cost_total > 0.0 {
         p.lines.push(format!(
             "est. cost: {} total · {} in 24h",
@@ -183,8 +196,12 @@ fn add_local_lines(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
         ));
     }
     for m in stats.models.iter().take(3) {
+        let tps = m
+            .tps
+            .map(|v| format!(" · {:.0} tok/s", v))
+            .unwrap_or_default();
         p.lines.push(format!(
-            "  {:<22} {} · {} req{}",
+            "  {:<22} {} · {} req{}{}",
             m.model,
             fmt_tokens(m.tokens),
             m.requests,
@@ -192,7 +209,8 @@ fn add_local_lines(p: &mut Panel, cfg: &Config, stats: &local::Stats) {
                 format!(" · {}", fmt_money(m.cost))
             } else {
                 String::new()
-            }
+            },
+            tps
         ));
     }
     if let Some(last) = &stats.last_request {
@@ -664,10 +682,73 @@ fn zai_panel(cfg: &Config, stats: &local::Stats, probe_lines: &[String]) -> Pane
         None => "no key (set ZAI_API_KEY)".to_string(),
     };
 
-    add_local_rows(&mut p, cfg, stats);
+    // when the gateway sends x-ratelimit-* headers they supersede the ZAI_LIMIT_* guesses
+    let live = live_limits(probe_lines);
+    let caps = Limits {
+        five_hour: if live.five_hour > 0 {
+            live.five_hour
+        } else {
+            cfg.zai_limits.five_hour
+        },
+        day: if live.day > 0 {
+            live.day
+        } else {
+            cfg.zai_limits.day
+        },
+        week: if live.week > 0 {
+            live.week
+        } else {
+            cfg.zai_limits.week
+        },
+        month: if live.month > 0 {
+            live.month
+        } else {
+            cfg.zai_limits.month
+        },
+        rpm: if live.rpm > 0 {
+            live.rpm
+        } else {
+            cfg.zai_limits.rpm
+        },
+    };
+    add_local_rows(&mut p, cfg, stats, &caps);
     for l in probe_lines {
         p.lines.push(l.clone());
     }
+    add_local_lines(&mut p, cfg, stats);
+    p
+}
+
+/// Caps derived from live `x-ratelimit-*` response headers (zero where absent).
+/// Header names seen in the wild: `x-ratelimit-limit`, `x-ratelimit-limit-day`,
+/// `x-ratelimit-remaining`, `x-ratelimit-reset`. Checked 2026-10-09: api.z.ai sends
+/// none, so this is a probe that only takes effect if the gateway starts sending them.
+fn live_limits(probe_lines: &[String]) -> Limits {
+    let get = |key: &str| -> u64 {
+        for l in probe_lines {
+            let pre = format!("{key}: ");
+            if l.starts_with(&pre) {
+                return l[pre.len()..].trim().parse().unwrap_or(0);
+            }
+        }
+        0
+    };
+    Limits {
+        five_hour: get("x-ratelimit-limit-5h"),
+        day: get("x-ratelimit-limit-day"),
+        week: get("x-ratelimit-limit-week"),
+        month: get("x-ratelimit-limit-month"),
+        rpm: get("x-ratelimit-limit"),
+    }
+}
+
+/// Providers with no quota API: everything comes from the local session logs. Bars only
+/// appear when a cap is configured for them, otherwise the panel is totals + throughput.
+fn local_panel(cfg: &Config, name: &str, stats: &local::Stats) -> Panel {
+    let mut p = Panel::new(name);
+    p.source = Some("local accounting (no public quota API)".into());
+    p.subtitle = "session logs".to_string();
+    add_local_rows(&mut p, cfg, stats, &Limits::default());
     add_local_lines(&mut p, cfg, stats);
     p
 }
@@ -765,22 +846,43 @@ fn openrouter_panel(
     let week_elapsed = day_elapsed + (now.weekday().num_days_from_monday() as u64) * 86400;
     let month_elapsed = day_elapsed + (now.day0() as u64) * 86400;
 
-    for (label, key_name, window, elapsed) in [
-        ("daily", "usage_daily", 86400u64, day_elapsed),
-        ("weekly", "usage_weekly", 7 * 86400, week_elapsed),
-        ("monthly", "usage_monthly", 30 * 86400, month_elapsed),
+    for (label, key_name, window, elapsed, budget) in [
+        (
+            "daily",
+            "usage_daily",
+            86400u64,
+            day_elapsed,
+            cfg.budget.day,
+        ),
+        (
+            "weekly",
+            "usage_weekly",
+            7 * 86400,
+            week_elapsed,
+            cfg.budget.week,
+        ),
+        (
+            "monthly",
+            "usage_monthly",
+            30 * 86400,
+            month_elapsed,
+            cfg.budget.month,
+        ),
     ] {
         let v = num(d, key_name).unwrap_or(0.0);
         let mut r = Row::new(
             label,
-            if total_credits > 0.0 {
+            if budget > 0 {
+                (v / budget as f64) * 100.0
+            } else if total_credits > 0.0 {
                 (v / total_credits) * 100.0
             } else {
                 0.0
             },
             fmt_money(v),
         );
-        if total_credits > 0.0 {
+        if budget > 0 {
+            r.set_cap(&fmt_money(budget as f64));
             if let Some(pa) = pace::assess_elapsed(elapsed, window, r.pct, cfg.pace_trigger) {
                 r.pace = Some(pace::label(&pa));
             }
@@ -890,27 +992,40 @@ fn cap_notes(hist: &mut history::History, p: &Panel, now: &str) -> Vec<String> {
         .collect()
 }
 
+fn fetch_provider(cfg: &Config, pricing: &Pricing, name: &str) -> Panel {
+    match name {
+        "codex" => codex(cfg, pricing),
+        "claude" => claude(cfg, pricing),
+        "copilot" => copilot(cfg, pricing),
+        "z.ai" | "zai" => zai(cfg, pricing),
+        "openrouter" => openrouter(cfg, pricing),
+        other => local_panel(
+            cfg,
+            other,
+            &local::pi_usage(&cfg.pi_session_dir, other, pricing),
+        ),
+    }
+}
+
 pub fn fetch_all(cfg: &Config, pricing: &Pricing) -> Snapshot {
     let mut hist = history::History::load(&cfg.cache_dir);
     let now = Utc::now().to_rfc3339();
-    let mut panels = Vec::new();
-    for name in &cfg.providers {
-        let mut p = match name.as_str() {
-            "codex" => codex(cfg, pricing),
-            "claude" => claude(cfg, pricing),
-            "copilot" => copilot(cfg, pricing),
-            "z.ai" | "zai" => zai(cfg, pricing),
-            "openrouter" => openrouter(cfg, pricing),
-            other => {
-                let mut p = Panel::new(other);
-                p.error = Some("unknown provider".into());
-                p
-            }
-        };
-        merge_cached(cfg, &mut p);
-        let notes = cap_notes(&mut hist, &p, &now);
+
+    // Fetch concurrently: total latency is the slowest provider, not the sum.
+    // Panels are collected in provider order so the display stays stable.
+    let mut panels: Vec<Panel> = std::thread::scope(|s| {
+        let handles: Vec<_> = cfg
+            .providers
+            .iter()
+            .map(|name| s.spawn(move || fetch_provider(cfg, pricing, name)))
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+
+    for p in &mut panels {
+        merge_cached(cfg, p);
+        let notes = cap_notes(&mut hist, p, &now);
         p.lines.extend(notes);
-        panels.push(p);
     }
     hist.save(&cfg.cache_dir);
     Snapshot {
@@ -1065,7 +1180,10 @@ mod tests {
 
     #[test]
     fn openrouter_credits_and_calendar_windows() {
-        let cfg = test_config();
+        let mut cfg = test_config();
+        cfg.budget.day = 100;
+        cfg.budget.week = 200;
+        cfg.budget.month = 200;
         let d: Value = serde_json::json!({
             "label": "test key",
             "usage": 100.0,
@@ -1084,9 +1202,10 @@ mod tests {
         assert_eq!(p.rows.len(), 5);
         assert_eq!(p.rows[0].pct, 50.0); // 100 used of 200
         assert_eq!(p.rows[1].pct, 10.0); // 100 of 1000 key limit
-        assert_eq!(p.rows[2].pct, 25.0); // daily
-        assert_eq!(p.rows[3].pct, 50.0); // weekly
-        assert_eq!(p.rows[4].pct, 100.0); // monthly
+        assert_eq!(p.rows[2].pct, 50.0); // 50 of a 100 daily budget
+        assert_eq!(p.rows[3].pct, 50.0); // 100 of a 200 weekly budget
+        assert_eq!(p.rows[4].pct, 100.0); // 200 of a 200 monthly budget
+        assert_eq!(p.rows[2].cap.as_deref(), Some("$100.00"));
         assert!(p
             .lines
             .iter()
@@ -1096,8 +1215,9 @@ mod tests {
             .iter()
             .any(|l| l.contains("pricing cache: 1 models · test")));
 
-        // without credits, calendar rows have nothing to pace against
-        let free = openrouter_panel(&cfg, &Pricing::default(), &d, None, None);
+        // without a budget, calendar rows have nothing to pace against
+        let cfg2 = test_config();
+        let free = openrouter_panel(&cfg2, &Pricing::default(), &d, None, None);
         assert_eq!(free.rows[0].pct, 0.0);
         assert!(free.rows.iter().all(|r| r.pace.is_none()));
         assert!(!free.lines.iter().any(|l| l.contains("pricing cache")));
@@ -1121,6 +1241,9 @@ mod tests {
                 model: "glm-4.6".into(),
                 requests: 12,
                 tokens: 1_000_000,
+                output: 0,
+                secs: 0.0,
+                tps: None,
                 cost: 0.0,
             }],
             ..Default::default()
@@ -1147,6 +1270,23 @@ mod tests {
     }
 
     #[test]
+    fn live_ratelimit_headers_override_the_configured_caps() {
+        let cfg = test_config();
+        let s = local::Stats {
+            tokens_5h: 80_000,
+            tokens_24h: 200_000,
+            tokens_7d: 1_000_000,
+            requests: 60,
+            requests_5h: 60,
+            ..Default::default()
+        };
+        // rpm cap comes from the live header; day cap falls back to ZAI_LIMIT_DAY
+        let p = zai_panel(&cfg, &s, &["x-ratelimit-limit: 60".to_string()]);
+        assert_eq!(p.rows[3].detail, "12.0 / 60");
+        assert_eq!(p.rows[1].cap, Some(fmt_tokens(cfg.zai_limits.day)));
+    }
+
+    #[test]
     fn keys_are_masked_in_output() {
         let cfg = test_config();
         let mut c = cfg.clone();
@@ -1157,11 +1297,16 @@ mod tests {
     }
 
     #[test]
-    fn unknown_provider_is_reported() {
+    fn unknown_providers_fall_back_to_the_local_logs() {
         let mut cfg = test_config();
         cfg.providers = vec!["nonsense".into()];
         let snap = fetch_all(&cfg, &Pricing::default());
-        assert_eq!(snap.panels[0].error.as_deref(), Some("unknown provider"));
+        let p = &snap.panels[0];
+        assert_eq!(p.name, "nonsense");
+        assert_eq!(p.subtitle, "session logs");
+        assert_eq!(p.rows.len(), 4);
+        assert!(p.rows.iter().all(|r| r.cap.is_none()));
+        assert!(p.lines.iter().any(|l| l.starts_with("requests: 0")));
     }
 
     #[test]
@@ -1215,5 +1360,37 @@ mod tests {
             vec!["cap 5.00M → 10.00M (first seen 2026-10-09T00:00:00Z)".to_string()]
         );
         assert!(cap_notes(&mut hist, &p, "2026-10-11T00:00:00Z").is_empty());
+    }
+
+    #[test]
+    fn local_panels_report_throughput_and_have_no_bars_without_a_cap() {
+        let cfg = test_config();
+        let stats = local::collect(&[local::Event {
+            ts: Utc::now() - chrono::Duration::minutes(10),
+            tokens: 600,
+            output: 500,
+            secs: 10.0,
+            cost: 0.0,
+            model: "gemma4:26b".into(),
+        }]);
+
+        // a provider with no quota API and no configured cap: totals + throughput, no bars
+        let p = local_panel(&cfg, "ollama", &stats);
+        assert_eq!(p.rows.len(), 4);
+        assert!(p.rows.iter().all(|r| r.cap.is_none()));
+        assert!(p.rows.iter().all(|r| r.pct == 0.0));
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "output tok/s: 50.0 (24h mean) · last 50.0"));
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l.contains("gemma4:26b") && l.contains("· 50 tok/s")));
+
+        // z.ai keeps its bars because ZAI_LIMIT_* is configured
+        let z = zai_panel(&cfg, &stats, &[]);
+        assert_eq!(z.rows.len(), 4);
+        assert!(z.lines.iter().any(|l| l.contains("output tok/s")));
     }
 }

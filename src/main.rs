@@ -23,7 +23,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, backend::TestBackend, layout::Position, Terminal};
 
 use crate::config::Config;
-use crate::model::{fmt_tokens, Snapshot};
+use crate::model::{ascii_bar, fmt_tokens, Snapshot};
 use crate::pricing::Pricing;
 
 const HELP: &str = "aitop — htop for AI usage\n\n\
@@ -34,17 +34,9 @@ providers:\n\
   claude     GET {ANTHROPIC_BASE_URL}/api/oauth/usage + local session logs\n\
   copilot    GET {GITHUB_API_BASE_URL}/copilot_internal/user (GITHUB_TOKEN)\n\
   z.ai       no public quota API → local accounting from PI_SESSION_DIR vs ZAI_LIMIT_*\n\
-  openrouter GET {OPENROUTER_BASE_URL}/key + /credits\n\n\
+  openrouter GET {OPENROUTER_BASE_URL}/key + /credits\n\
+  other      no quota API → local session logs (totals + output tok/s)\n\n\
 --plain/--json print one snapshot; add --watch N to keep refreshing every N seconds\n--redact hides the account email and API key prefixes (useful when piping --json to a file)\n--history draws the sparkline over 7 daily buckets instead of 24 hourly ones\n";
-
-fn ascii_bar(pct: f64, width: usize) -> String {
-    let filled = ((pct / 100.0).clamp(0.0, 1.0) * width as f64).round() as usize;
-    let mut s = String::new();
-    for i in 0..width {
-        s.push(if i < filled { '█' } else { '░' });
-    }
-    s
-}
 
 const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -222,8 +214,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute!(out, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
+    // A panic while unwinding would otherwise leave the terminal in raw mode with
+    // the cursor hidden; restore it before the default hook prints the report.
+    std::panic::set_hook(Box::new(|info| {
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        eprintln!("panic: {info}");
+    }));
+
     let result = run_loop(&mut terminal, &mut state, &force, &rx);
 
+    std::panic::set_hook(Box::new(|info| eprintln!("panic: {info}")));
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -274,15 +275,6 @@ fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ascii_bar_clamps_to_width() {
-        assert_eq!(ascii_bar(0.0, 10), "░░░░░░░░░░");
-        assert_eq!(ascii_bar(50.0, 10), "█████░░░░░");
-        assert_eq!(ascii_bar(100.0, 10), "██████████");
-        assert_eq!(ascii_bar(150.0, 10), "██████████"); // clamped
-        assert_eq!(ascii_bar(-5.0, 10), "░░░░░░░░░░"); // clamped
-    }
 
     #[test]
     fn sparkline_scales_to_the_tallest_bucket() {

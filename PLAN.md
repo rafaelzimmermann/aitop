@@ -52,9 +52,16 @@ Each provider is `fetch → parse → panel_builder`; the JSON→Panel part is p
       last_seen, prev}}`), so a plan change is visible as "cap went 5M → 10M" instead of a
       hardcoded `ZAI_LIMIT_*`. Rows carry a `cap` field (also in `--json`); the first sighting
       is silent, a change prints one line per run.
-- [ ] z.ai: derive the cap from the live `x-ratelimit-*` headers when the gateway sends
-      them, falling back to `ZAI_LIMIT_*`. Checked 2026-10-09: `api.z.ai` returns no
-      `x-ratelimit-*` headers at all, so the probe only prints them when they appear.
+- [x] z.ai: derive the cap from the live `x-ratelimit-*` headers when the gateway sends
+      them, falling back to `ZAI_LIMIT_*` (`live_limits` in providers.rs; checked 2026-10-09:
+      `api.z.ai` returns no `x-ratelimit-*` headers, so the probe only takes effect if they appear).
 - [x] optional: `--history` sparkline over 7d instead of 24h (`Stats.daily`, 7 daily buckets,
       exposed as `spark_label` in plain output and `--json`)
-- [ ] CI runs `cargo fmt --check`; the tree is formatted, keep it that way
+- [x] TUI rows use fixed columns (label 14 · pct 5 · bar 24 · detail) so bars line up across
+      rows regardless of label length; `Gauge` replaced by `Paragraph` spans, empty bar cells
+      dimmed, one palette (`Cyan` accent / `DarkGray` muted / `Gray` text) with green/yellow/red
+      thresholds and pace colors
+- [x] throughput: output tok/s from the parent→assistant gap in pi session logs
+      (`Event.secs`, `Stats.tps_24h`/`last_tps`, `ModelStat.tps`), and any provider name without
+      a quota API (`PROVIDERS=ollama,strata`) falls back to that local-log panel
+- [x] CI runs `cargo fmt --check`; the tree is formatted, keep it that way

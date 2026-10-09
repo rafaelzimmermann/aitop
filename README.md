@@ -52,6 +52,7 @@ TUI keys: `q` quit · `r` refresh now · `h` help · `1-9` focus provider · `Ta
 | copilot    | `GET https://api.github.com/copilot_internal/user` (`GITHUB_TOKEN`, `gh` token, or `~/.config/gh/oauth_token`) |
 | z.ai       | **no public quota API** → local accounting from `~/.pi/agent/sessions` (pi assistant messages with `usage`, provider `zai`) compared against configurable `ZAI_LIMIT_*`; plus a live `/models` probe that prints any `x-ratelimit-*` headers the gateway returns |
 | openrouter | `GET https://openrouter.ai/api/v1/key` and `/api/v1/credits`     |
+| any other  | no quota API → local session logs (`PROVIDERS=ollama,strata`), reported as totals plus output tok/s (generation time measured from each assistant message to its parent) |
 
 Model pricing for the local accounting comes from `GET {OPENROUTER_BASE_URL}/models`,
 cached in `~/.cache/aitop/pricing.json` for `PRICING_CACHE_HOURS` (24 by default).
@@ -77,13 +78,14 @@ Lookup order: `AITOP_ENV` → `./.env` → `~/.config/aitop/.env` → project `.
 | `CODEX_AUTH_FILE` | path to `~/.codex/auth.json` (or set `CODEX_ACCESS_TOKEN`) |
 | `CODEX_BASE_URL` | default `https://chatgpt.com/backend-api` |
 | `CODEX_INSTALLATION_ID` | sent as `x-codex-installation-id`; auto-read from `~/.codex/installation_id` |
-| `CLAUDE_CREDENTIALS_FILE` | path to `~/.claude/.credentials.json` (or set `ANTHROPIC_API_KEY`) |
+| `CLAUDE_CREDENTIALS_FILE` | path to `~/.claude/.credentials.json` (OAuth creds; `sk-` keys are not accepted by the usage endpoint — without them the row falls back to local accounting) |
 | `ANTHROPIC_BASE_URL` | default `https://api.anthropic.com` |
 | `GITHUB_TOKEN` | copilot token; falls back to `gh`'s stored token |
 | `GITHUB_API_BASE_URL` | default `https://api.github.com` |
 | `ZAI_API_KEY` / `ZAI_BASE_URL` | z.ai key + `https://api.z.ai/api/coding/paas/v4` |
 | `ZAI_LIMIT_5H` / `ZAI_LIMIT_DAY` / `ZAI_LIMIT_WEEK` / `ZAI_LIMIT_RPM` | assumed caps for the local z.ai accounting — tune to your plan |
 | `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` | OpenRouter key + base |
+| `OR_BUDGET_DAY` / `OR_BUDGET_WEEK` / `OR_BUDGET_MONTH` | optional daily/weekly/monthly spending budgets (USD); pace on OpenRouter calendar rows is computed against these, not against your lifetime balance |
 | `CODEX_SESSION_DIR` / `PI_SESSION_DIR` | local session-log directories used for the 24h sparkline and local accounting |
 | `AITOP_CACHE_DIR` | `~/.cache/aitop` — panel snapshots, pricing cache and `limits.json`, created 0700, files 0600 |
 | `PRICING_CACHE_HOURS` | pricing cache TTL (default 24) |
@@ -97,6 +99,9 @@ The Codex usage endpoint returns `403` without a `codex_cli_rs/*` User-Agent, so
 
 - z.ai bars are **estimates**: they are local token accounting against limits you configure, not server-reported quotas.
 - Local accounting only counts what is written to the session logs; anything done through other tools/clients is invisible.
+- `tok/s` is output tokens divided by the parent→assistant timestamp gap in the session logs.
+  It measures generation only: prefill time is not separable from the logs, so the number is an
+  upper bound on end-to-end throughput.
 - Secrets are never printed — only a masked key prefix.
 - `--json` includes the account email when a provider reports one (it is already in your
   local credential files and in the TUI panel header). Pipe it to a file or use `--redact`
