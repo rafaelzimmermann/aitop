@@ -48,8 +48,9 @@ chmod 600 ~/.config/aitop/.env
 ```
 
 When `PROVIDERS` is unset, aitop auto-detects the services configured on your machine
-(keys/auth files present, or a local strata/ollama engine listening on loopback) and shows
-only those panels, falling back to `codex` if nothing is configured. Choose your own order:
+(keys/auth files present, a local strata/ollama engine listening on loopback, or an
+OpenClaw state directory / gateway port present) and shows only those panels, falling
+back to `codex` if nothing is configured. Choose your own order:
 
 ```bash
 PROVIDERS=codex,claude,copilot,z.ai,openrouter,deepseek aitop
@@ -92,6 +93,7 @@ aitop --help
 | **DeepSeek** | Account balance from `/user/balance` | `DEEPSEEK_API_KEY`; local pi activity alongside the lifetime balance |
 | **Strata** | Engine status, model, context, and queue from `/status` and `/v1/models` | `STRATA_BASE_URL` (default `http://127.0.0.1:8081`); local pi activity |
 | **Ollama** | Loaded models and VRAM from `/api/ps` | `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434`); local pi activity |
+| **OpenClaw** | Gateway state plus active agent sessions (context window per session) | `OPENCLAW_DIR` (default `~/.openclaw`) and `OPENCLAW_PORT` (default `18789`); session rows read from each agent's `openclaw-agent.sqlite` |
 | **Other names** | Local session accounting | Matching provider entries under `PI_SESSION_DIR`; totals and throughput without artificial quota bars |
 
 Provider endpoints can change or reject credentials. Check each panel's source and error information: local estimates and cached snapshots do not prove that a server quota is available. Each HTTP request has a 10-second timeout; providers are fetched concurrently.
@@ -131,6 +133,7 @@ See [`.env.example`](.env.example) for a starting configuration. Use absolute pa
 | `OR_BUDGET_DAY` / `OR_BUDGET_WEEK` / `OR_BUDGET_MONTH` | Optional whole-dollar spending budgets |
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | Key and base; `https://api.deepseek.com` |
 | `STRATA_BASE_URL` / `OLLAMA_BASE_URL` | Local engine addresses; see provider table |
+| `OPENCLAW_DIR` / `OPENCLAW_PORT` | OpenClaw state directory and gateway port; `~/.openclaw` / `18789` |
 | `CODEX_SESSION_DIR` / `PI_SESSION_DIR` | Log roots; `~/.codex/sessions` / `~/.pi/agent/sessions` |
 | `AITOP_CACHE_DIR` | Cache location; `~/.cache/aitop` |
 | `PRICING_CACHE_HOURS` | Pricing cache lifetime; `24` |

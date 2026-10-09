@@ -1423,6 +1423,246 @@ pub fn ollama(cfg: &Config, pricing: &Pricing) -> Panel {
     }
 }
 
+// ---------------------------------------------------------------- OpenClaw (multi-agent gateway)
+
+/// One live agent session inside the OpenClaw gateway: the session node carries its
+/// own context allowance, so the bar is measured against the agent's window, not a
+/// guessed plan cap.
+#[derive(Clone, Debug, Default)]
+pub struct OpenClawSession {
+    pub key: String,
+    pub label: String,
+    pub model: String,
+    pub total_tokens: u64,
+    pub context_limit: u64,
+    pub cache_read: u64,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OpenClawSnapshot {
+    pub gateway_online: bool,
+    pub gateway_port: u16,
+    pub agents: Vec<String>,
+    pub telegram_enabled: bool,
+    pub public_origin: Option<String>,
+    pub sessions: Vec<OpenClawSession>,
+    pub error: Option<String>,
+}
+
+/// Active (non-archived) session nodes of one agent DB, newest first. sqlite3 is
+/// invoked with the DB path and the query as argv, so no shell quoting is involved.
+const SESSION_QUERY: &str =
+    "SELECT session_key, json_extract(entry_json, '$.model'), json_extract(entry_json, '$.totalTokens'), json_extract(entry_json, '$.contextTokens'), json_extract(entry_json, '$.cacheRead'), status FROM session_nodes WHERE archived_at IS NULL ORDER BY updated_at DESC LIMIT 5;";
+
+/// A machine without the sqlite3 binary (or without any agent DB) simply yields no
+/// rows: the panel still renders gateway and agent state.
+fn session_rows(db: &Path) -> Vec<OpenClawSession> {
+    let out = match std::process::Command::new("sqlite3")
+        .args(&[db.display().to_string(), SESSION_QUERY.to_string()])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let raw = match String::from_utf8(out.stdout).ok() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let mut rows: Vec<OpenClawSession> = Vec::new();
+    for line in raw.split('\n') {
+        let cols: Vec<String> = line.split('|').map(|c| c.trim().to_string()).collect();
+        if cols.len() < 6 {
+            continue;
+        }
+        let key = cols[0].to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let label = session_label(&key);
+        rows.push(OpenClawSession {
+            key,
+            label,
+            model: cols[1].to_string(),
+            total_tokens: cols[2].parse::<u64>().unwrap_or(0),
+            context_limit: cols[3].parse::<u64>().unwrap_or(0),
+            cache_read: cols[4].parse::<u64>().unwrap_or(0),
+            status: cols[5].to_string(),
+        });
+    }
+    rows
+}
+
+/// "agent:spike:main" → "spike:main": the leading "agent:" is noise in a 14-column
+/// TUI label.
+fn session_label(key: &str) -> String {
+    key.strip_prefix("agent:").unwrap_or(key).to_string()
+}
+
+/// Pure builder: gateway state plus discovered sessions become one panel.
+fn openclaw_panel(_cfg: &Config, snap: &OpenClawSnapshot) -> Panel {
+    let mut p = Panel::new("openclaw");
+    p.source = Some(if snap.gateway_online {
+        "live gateway & agent state".into()
+    } else {
+        "local agent state".into()
+    });
+    p.subtitle = if snap.gateway_online {
+        format!(
+            "{} agents · gateway :{} · Telegram {}",
+            snap.agents.len(),
+            snap.gateway_port,
+            if snap.telegram_enabled { "OK" } else { "off" },
+        )
+    } else {
+        format!("gateway offline · {} agents", snap.agents.len())
+    };
+    if let Some(err) = &snap.error {
+        p.error = Some(err.clone());
+    }
+
+    for s in &snap.sessions {
+        let label = if s.label.is_empty() {
+            session_label(&s.key)
+        } else {
+            s.label.clone()
+        };
+        let pct = if s.context_limit > 0 {
+            (s.total_tokens as f64 / s.context_limit as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        let detail = if s.cache_read > 0 && s.total_tokens > 0 {
+            // cacheRead accumulates across turns while totalTokens is the live context
+            // occupancy, so the ratio can exceed 100%: clamp it, a bar never lies
+            let cache_pct =
+                ((s.cache_read as f64 / s.total_tokens as f64 * 100.0).min(100.0)) as u64;
+            format!(
+                "{} / {} ({} · {}% cached)",
+                fmt_tokens(s.total_tokens),
+                fmt_tokens(s.context_limit),
+                s.model,
+                cache_pct,
+            )
+        } else if s.context_limit > 0 {
+            format!(
+                "{} / {} ({})",
+                fmt_tokens(s.total_tokens),
+                fmt_tokens(s.context_limit),
+                s.model,
+            )
+        } else {
+            format!("{} ({})", fmt_tokens(s.total_tokens), s.model)
+        };
+        let mut r = Row::new(&label, pct, detail);
+        if s.context_limit > 0 {
+            r.set_cap(&fmt_tokens(s.context_limit));
+        }
+        p.rows.push(r);
+    }
+
+    if !snap.agents.is_empty() {
+        p.lines.push(format!("agents: {}", snap.agents.join(", ")));
+    }
+    // sessions still generating are the ones an operator is actually watching
+    let running = snap
+        .sessions
+        .iter()
+        .filter(|s| s.status == "running")
+        .count();
+    if running > 0 {
+        p.lines
+            .push(format!("⚡ {} session(s) generating", running));
+    }
+    p.lines.push(format!(
+        "channels: Telegram ({}) · gateway :{}",
+        if snap.telegram_enabled {
+            "active"
+        } else {
+            "disabled"
+        },
+        snap.gateway_port,
+    ));
+    p
+}
+
+fn openclaw_snapshot(cfg: &Config) -> OpenClawSnapshot {
+    let mut snap = OpenClawSnapshot {
+        gateway_online: config::is_local_listening(&format!(
+            "http://127.0.0.1:{}",
+            cfg.openclaw_port
+        )),
+        gateway_port: cfg.openclaw_port,
+        agents: Vec::new(),
+        telegram_enabled: false,
+        public_origin: None,
+        sessions: Vec::new(),
+        error: None,
+    };
+
+    let v: Value = match std::fs::read_to_string(cfg.openclaw_dir.join("openclaw.json")).ok() {
+        Some(r) => match serde_json::from_str(&r) {
+            Ok(v) => v,
+            Err(_) => Value::Null,
+        },
+        None => Value::Null,
+    };
+    if let Some(port) = v
+        .get("gateway")
+        .and_then(|g| g.get("port"))
+        .and_then(|x| x.as_f64())
+    {
+        snap.gateway_port = port.min(65535.0) as u16;
+    }
+    snap.telegram_enabled = v
+        .get("channels")
+        .and_then(|c| c.get("telegram"))
+        .and_then(|t| t.get("enabled"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    snap.public_origin = v
+        .get("publicOrigin")
+        .or_else(|| v.get("gateway").and_then(|g| g.get("publicOrigin")))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+
+    // agent discovery: every subdirectory of agents/ is one registered agent
+    let agents_dir = cfg.openclaw_dir.join("agents");
+    let mut agent_dbs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&agents_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(name) = &p.file_name() {
+                    snap.agents.push(name.display().to_string());
+                }
+                let db = p.join("agent").join("openclaw-agent.sqlite");
+                if db.is_file() {
+                    agent_dbs.push(db.clone());
+                }
+            }
+        }
+    }
+    snap.agents.sort();
+
+    for db in &agent_dbs {
+        for s in session_rows(db) {
+            if snap.sessions.iter().any(|prev| prev.key == s.key) {
+                continue;
+            }
+            snap.sessions.push(s.clone());
+        }
+    }
+    // the TUI row area is bounded; the five most recently touched sessions are the
+    // ones an operator actually cares about
+    snap.sessions.truncate(5);
+    snap
+}
+
+pub fn openclaw(cfg: &Config, _pricing: &Pricing) -> Panel {
+    openclaw_panel(cfg, &openclaw_snapshot(cfg))
+}
+
 // ---------------------------------------------------------------- all
 
 fn panel_cache_path(dir: &Path, name: &str) -> PathBuf {
@@ -1480,6 +1720,7 @@ fn fetch_provider(cfg: &Config, pricing: &Pricing, name: &str) -> Panel {
         "deepseek" => deepseek(cfg, pricing),
         "strata" => strata(cfg, pricing),
         "ollama" => ollama(cfg, pricing),
+        "openclaw" => openclaw(cfg, pricing),
         other => local_panel(
             cfg,
             other,
@@ -2262,5 +2503,121 @@ mod tests {
             .lines
             .iter()
             .any(|l| l == "requests: 9 total · 4 in last 5h"));
+    }
+
+    #[test]
+    fn openclaw_panel_with_live_sessions() {
+        let cfg = test_config();
+        let snap = OpenClawSnapshot {
+            gateway_online: true,
+            gateway_port: 18789,
+            agents: vec!["spike".into(), "helper".into(), "worker".into()],
+            telegram_enabled: true,
+            public_origin: Some("https://openclaw.example".into()),
+            sessions: vec![
+                OpenClawSession {
+                    key: "agent:spike:main".into(),
+                    label: "spike:main".into(),
+                    model: "gpt-6-luna".into(),
+                    total_tokens: 31_734,
+                    context_limit: 258_400,
+                    cache_read: 31_488,
+                    status: "done".into(),
+                },
+                OpenClawSession {
+                    key: "agent:helper:main".into(),
+                    label: "helper:main".into(),
+                    model: "qwen3.8-flash-next-iq2_xs".into(),
+                    total_tokens: 12_000,
+                    context_limit: 24_000,
+                    cache_read: 0,
+                    status: "running".into(),
+                },
+                OpenClawSession {
+                    key: "agent:worker:cron".into(),
+                    label: String::new(),
+                    model: "qwen3.8-flash-next-iq2_xs".into(),
+                    total_tokens: 900,
+                    context_limit: 0,
+                    cache_read: 0,
+                    status: "done".into(),
+                },
+            ],
+            error: None,
+        };
+
+        let p = openclaw_panel(&cfg, &snap);
+        assert_eq!(p.name, "openclaw");
+        assert_eq!(p.source, Some("live gateway & agent state".to_string()));
+        assert_eq!(
+            p.subtitle,
+            "3 agents · gateway :18789 · Telegram OK".to_string()
+        );
+        assert!(p.error.is_none());
+        assert_eq!(p.rows.len(), 3);
+
+        assert_eq!(p.rows[0].label, "spike:main");
+        assert_eq!(p.rows[0].cap.as_deref(), Some("258.4k"));
+        assert!(
+            p.rows[0].pct > 12.0 && p.rows[0].pct < 13.0,
+            "31.7k of a 258.4k window"
+        );
+        assert_eq!(
+            p.rows[0].detail,
+            "31.7k / 258.4k (gpt-6-luna · 99% cached)".to_string(),
+        );
+
+        assert_eq!(p.rows[1].label, "helper:main");
+        assert_eq!(p.rows[1].pct, 50.0);
+        assert_eq!(
+            p.rows[1].detail,
+            "12.0k / 24.0k (qwen3.8-flash-next-iq2_xs)".to_string(),
+        );
+
+        // a session with no context allowance still gets a row, just no bar or cap
+        assert_eq!(
+            p.rows[2].label, "worker:cron",
+            "the leading \"agent:\" is stripped"
+        );
+        assert_eq!(p.rows[2].pct, 0.0);
+        assert!(p.rows[2].cap.is_none());
+        assert_eq!(
+            p.rows[2].detail,
+            "900 (qwen3.8-flash-next-iq2_xs)".to_string()
+        );
+
+        assert!(p.lines.iter().any(|l| l == "agents: spike, helper, worker"));
+        assert!(p.lines.iter().any(|l| l == "⚡ 1 session(s) generating"));
+        assert!(p
+            .lines
+            .iter()
+            .any(|l| l == "channels: Telegram (active) · gateway :18789"));
+    }
+
+    #[test]
+    fn openclaw_panel_offline_fallback() {
+        let cfg = test_config();
+        let snap = OpenClawSnapshot {
+            gateway_online: false,
+            gateway_port: 18789,
+            agents: vec!["helper".into(), "spike".into()],
+            telegram_enabled: false,
+            public_origin: None,
+            sessions: Vec::new(),
+            error: Some("sqlite3 unavailable".into()),
+        };
+
+        let p = openclaw_panel(&cfg, &snap);
+        assert_eq!(p.name, "openclaw");
+        assert_eq!(p.source, Some("local agent state".to_string()));
+        assert_eq!(p.subtitle, "gateway offline · 2 agents".to_string());
+        assert_eq!(p.error.as_deref(), Some("sqlite3 unavailable"));
+        assert!(p.rows.is_empty(), "no sessions discovered → no bars");
+        assert_eq!(p.lines.len(), 2);
+        assert_eq!(p.lines[0], "agents: helper, spike".to_string());
+        assert_eq!(
+            p.lines[1],
+            "channels: Telegram (disabled) · gateway :18789".to_string(),
+        );
     }
 }

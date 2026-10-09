@@ -49,6 +49,10 @@ pub struct Config {
     pub strata_base: String,
     pub ollama_base: String,
 
+    /// OpenClaw multi-agent gateway: local state dir + ws/http port
+    pub openclaw_dir: PathBuf,
+    pub openclaw_port: u16,
+
     pub codex_session_dir: PathBuf,
     pub pi_session_dir: PathBuf,
 
@@ -185,6 +189,12 @@ pub fn load() -> Config {
         strata_base: env("STRATA_BASE_URL", "http://127.0.0.1:8081"),
         ollama_base: env("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
 
+        openclaw_dir: PathBuf::from(env(
+            "OPENCLAW_DIR",
+            &h.join(".openclaw").display().to_string(),
+        )),
+        openclaw_port: env_num("OPENCLAW_PORT", 18789) as u16,
+
         codex_session_dir: PathBuf::from(env(
             "CODEX_SESSION_DIR",
             &h.join(".codex/sessions").display().to_string(),
@@ -259,6 +269,11 @@ pub fn auto_detect_providers(cfg: &Config) -> Vec<String> {
     }
     if env_opt("OLLAMA_BASE_URL").is_some() || is_local_listening(&cfg.ollama_base) {
         detected.push("ollama".into());
+    }
+    if cfg.openclaw_dir.exists()
+        || is_local_listening(&format!("http://127.0.0.1:{}", cfg.openclaw_port))
+    {
+        detected.push("openclaw".into());
     }
     if detected.is_empty() {
         vec!["codex".into()]
@@ -391,6 +406,8 @@ pub fn test_config() -> Config {
         deepseek_base: "https://api.deepseek.com".into(),
         strata_base: "http://127.0.0.1:8081".into(),
         ollama_base: "http://127.0.0.1:11434".into(),
+        openclaw_dir: PathBuf::from("/tmp/aitop-test-home/.openclaw"),
+        openclaw_port: 18789,
         codex_session_dir: PathBuf::from("/tmp/aitop-test-home/.codex/sessions"),
         pi_session_dir: PathBuf::from("/tmp/aitop-test-home/.pi/agent/sessions"),
         zai_limits: Limits {
@@ -475,6 +492,8 @@ mod tests {
         // point the local-engine probes at ports nothing can be listening on
         cfg.strata_base = "http://127.0.0.1:1".into();
         cfg.ollama_base = "http://127.0.0.1:2".into();
+        cfg.openclaw_dir = PathBuf::from("/tmp/aitop-test-home/definitely-missing");
+        cfg.openclaw_port = 1;
         assert_eq!(auto_detect_providers(&cfg), vec!["codex".to_string()]);
     }
 
@@ -486,6 +505,8 @@ mod tests {
         let mut cfg = test_config();
         cfg.strata_base = "http://127.0.0.1:1".into();
         cfg.ollama_base = "http://127.0.0.1:2".into();
+        cfg.openclaw_dir = PathBuf::from("/tmp/aitop-test-home/definitely-missing");
+        cfg.openclaw_port = 1;
         cfg.deepseek_key = Some("ds-synthetic-key".into());
         cfg.zai_key = Some("zk-synthetic-key".into());
         assert_eq!(
@@ -493,6 +514,28 @@ mod tests {
             vec!["z.ai".to_string(), "deepseek".to_string()],
             "only configured providers appear, in stable order"
         );
+    }
+
+    #[test]
+    fn auto_detect_includes_openclaw_when_its_state_dir_exists() {
+        let dir = std::env::temp_dir().join("aitop-test-openclaw-dir");
+        let _ = std::fs::create_dir_all(dir.join("agents"));
+        let mut cfg = test_config();
+        cfg.openclaw_dir = dir.clone();
+        // a gateway on this machine must not be the reason the panel appears here
+        cfg.openclaw_port = 1;
+        let detected = auto_detect_providers(&cfg);
+        assert!(
+            detected.contains(&"openclaw".to_string()),
+            "state dir alone is enough"
+        );
+        let last: String = detected.last().unwrap().clone();
+        assert_eq!(
+            last,
+            "openclaw".to_string(),
+            "openclaw comes last, after ollama"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
