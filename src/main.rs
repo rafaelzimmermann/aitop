@@ -38,7 +38,8 @@ providers:\n\
   deepseek   GET {DEEPSEEK_BASE_URL}/user/balance (DEEPSEEK_API_KEY) + local session logs\n\
   strata     GET {STRATA_BASE_URL}/status + /v1/models (local engine state & context)\n\
   ollama     GET {OLLAMA_BASE_URL}/api/ps (loaded models & VRAM usage)\n\
-  other      no quota API → local session logs (totals + output tok/s)\n\n\
+  other      no quota API → local session logs (totals + output tok/s)\n\
+  default    PROVIDERS unset → auto-detect: only configured/active services are shown\n\n\
 --plain/--json print one snapshot; add --watch N to keep refreshing every N seconds\n--redact hides the account email and API key prefixes (useful when piping --json to a file)\n--history draws the sparkline over 7 daily buckets instead of 24 hourly ones\n";
 
 const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];

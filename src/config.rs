@@ -141,23 +141,7 @@ pub fn load() -> Config {
     }
 
     let h = home();
-    let providers = env_opt("PROVIDERS")
-        .map(|s| {
-            s.split(',')
-                .map(|p| p.trim().to_lowercase())
-                .filter(|p| !p.is_empty())
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            vec![
-                "codex".into(),
-                "deepseek".into(),
-                "z.ai".into(),
-                "openrouter".into(),
-            ]
-        });
-
-    Config {
+    let mut cfg = Config {
         refresh_secs: env_num("REFRESH_SECONDS", 5),
         redact: env_bool("AITOP_REDACT", false),
         history: env_bool("AITOP_HISTORY", false),
@@ -228,8 +212,132 @@ pub fn load() -> Config {
 
         pace_trigger: env_float("PACE_TRIGGER", 10.0),
         pricing_max_age_hours: env_num("PRICING_CACHE_HOURS", 24) as i64,
-        providers,
+        providers: vec![],
+    };
+
+    // An explicit PROVIDERS list is honored verbatim; otherwise show only the
+    // providers that are actually configured or active on this machine.
+    cfg.providers = env_opt("PROVIDERS")
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|| auto_detect_providers(&cfg));
+
+    cfg
+}
+
+/// Providers with credentials, auth files or live local engines on this machine.
+/// Stable order so panels do not jump around between refreshes.
+pub fn auto_detect_providers(cfg: &Config) -> Vec<String> {
+    let mut detected: Vec<String> = vec![];
+    if codex_access_token(cfg).is_some()
+        || cfg.codex_auth_file.exists()
+        || cfg.codex_session_dir.exists()
+    {
+        detected.push("codex".into());
     }
+    if cfg.claude_credentials_file.exists() || env_opt("ANTHROPIC_API_KEY").is_some() {
+        detected.push("claude".into());
+    }
+    if cfg.github_token.is_some() {
+        detected.push("copilot".into());
+    }
+    if cfg.zai_key.is_some() {
+        detected.push("z.ai".into());
+    }
+    if cfg.openrouter_key.is_some() {
+        detected.push("openrouter".into());
+    }
+    if cfg.deepseek_key.is_some() {
+        detected.push("deepseek".into());
+    }
+    if env_opt("STRATA_BASE_URL").is_some() || is_local_listening(&cfg.strata_base) {
+        detected.push("strata".into());
+    }
+    if env_opt("OLLAMA_BASE_URL").is_some() || is_local_listening(&cfg.ollama_base) {
+        detected.push("ollama".into());
+    }
+    if detected.is_empty() {
+        vec!["codex".into()]
+    } else {
+        detected
+    }
+}
+
+/// Fail-safe probe for local inference engines: only loopback hosts are checked,
+/// with a 50 ms non-blocking connect so a refresh tick never hangs.
+pub fn is_local_listening(base_url: &str) -> bool {
+    let s = base_url.trim();
+    let secure = s.starts_with("https://");
+    let rest = match s.find("://") {
+        Some(i) => &s[i + 3..],
+        None => return false,
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+
+    let host: String;
+    let port_str: Option<String>;
+    if host_port.starts_with("[") {
+        let close = host_port.find("]").unwrap_or(0);
+        if close == 0 {
+            return false;
+        }
+        host = host_port[1..close].to_lowercase();
+        let after = &host_port[close + 1..];
+        port_str = if after.is_empty() {
+            None
+        } else if let Some(tail) = after.strip_prefix(":") {
+            Some(tail.to_string())
+        } else {
+            return false;
+        };
+    } else {
+        match host_port.find(":") {
+            Some(c) => {
+                host = host_port[..c].to_lowercase();
+                port_str = Some(host_port[c + 1..].to_string());
+            }
+            None => {
+                host = host_port.to_lowercase();
+                port_str = None;
+            }
+        }
+    }
+
+    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        return false;
+    }
+
+    let port: u16 = match port_str {
+        None => {
+            if secure {
+                443
+            } else {
+                80
+            }
+        }
+        Some(p) => match p.parse::<u16>().ok() {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+
+    // normalize the loopback spellings to a dotted-quad V4 address
+    let normalized = if host == "localhost" || host == "::1" {
+        "127.0.0.1"
+    } else {
+        host.as_str()
+    };
+    let ip = match normalized.parse::<std::net::IpAddr>().ok() {
+        Some(std::net::IpAddr::V4(v4)) => v4,
+        _ => return false,
+    };
+    let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port));
+
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50)).is_ok()
 }
 
 fn parse_auth_token(raw: &str, key: &str) -> Option<String> {
@@ -356,5 +464,49 @@ mod tests {
         cfg.codex_token = None;
         assert_eq!(codex_access_token(&cfg), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_detect_falls_back_to_codex_when_empty() {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("STRATA_BASE_URL");
+        std::env::remove_var("OLLAMA_BASE_URL");
+        let mut cfg = test_config();
+        // point the local-engine probes at ports nothing can be listening on
+        cfg.strata_base = "http://127.0.0.1:1".into();
+        cfg.ollama_base = "http://127.0.0.1:2".into();
+        assert_eq!(auto_detect_providers(&cfg), vec!["codex".to_string()]);
+    }
+
+    #[test]
+    fn auto_detect_picks_only_configured_providers() {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("STRATA_BASE_URL");
+        std::env::remove_var("OLLAMA_BASE_URL");
+        let mut cfg = test_config();
+        cfg.strata_base = "http://127.0.0.1:1".into();
+        cfg.ollama_base = "http://127.0.0.1:2".into();
+        cfg.deepseek_key = Some("ds-synthetic-key".into());
+        cfg.zai_key = Some("zk-synthetic-key".into());
+        assert_eq!(
+            auto_detect_providers(&cfg),
+            vec!["z.ai".to_string(), "deepseek".to_string()],
+            "only configured providers appear, in stable order"
+        );
+    }
+
+    #[test]
+    fn is_local_listening_tolerates_invalid_urls() {
+        assert!(!is_local_listening("not-a-url"));
+        assert!(!is_local_listening(""));
+        assert!(
+            !is_local_listening("http://192.168.1.5:9"),
+            "non-local host is never probed"
+        );
+        assert!(!is_local_listening("http://127.0.0.1:notaport"));
+        assert!(
+            !is_local_listening("http://127.0.0.1:99999"),
+            "port out of range"
+        );
     }
 }

@@ -47,7 +47,9 @@ cp .env.example ~/.config/aitop/.env  # first-time setup; preserve an existing c
 chmod 600 ~/.config/aitop/.env
 ```
 
-The default panels are `codex,deepseek,z.ai,openrouter`. Choose your own order:
+When `PROVIDERS` is unset, aitop auto-detects the services configured on your machine
+(keys/auth files present, or a local strata/ollama engine listening on loopback) and shows
+only those panels, falling back to `codex` if nothing is configured. Choose your own order:
 
 ```bash
 PROVIDERS=codex,claude,copilot,z.ai,openrouter,deepseek aitop
@@ -112,7 +114,7 @@ See [`.env.example`](.env.example) for a starting configuration. Use absolute pa
 
 | Variable | Purpose / default |
 | --- | --- |
-| `PROVIDERS` | Panel order; `codex,deepseek,z.ai,openrouter` |
+| `PROVIDERS` | Panel order; when unset, auto-detects configured/active services (fallback `codex`) |
 | `REFRESH_SECONDS` | Dashboard refresh interval; `5` |
 | `AITOP_REDACT` | Hide account email and key prefixes; `1` enables |
 | `AITOP_HISTORY` | Use seven daily sparkline buckets; `1` enables |
