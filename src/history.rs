@@ -1,9 +1,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use chrono::{DateTime, Local};
+
 use crate::util;
 
 const FILE: &str = "limits.json";
+
+/// Usage inside a rolling window only ever goes up, so a pct drop of this
+/// size between two sightings means the window rolled over.
+const ROLLOVER_DROP: f64 = 50.0;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Entry {
@@ -11,6 +17,8 @@ struct Entry {
     first_seen: String,
     last_seen: String,
     prev: Option<String>,
+    #[serde(default)]
+    last_pct: Option<f64>,
 }
 
 /// Per-provider/window caps seen across runs, so a plan change shows up as
@@ -50,8 +58,17 @@ impl History {
             first_seen: now.to_string(),
             last_seen: now.to_string(),
             prev: None,
+            last_pct: None,
         });
-        if entry.cap == cap {
+        if !entry.cap.is_empty() && entry.cap == cap {
+            entry.last_seen = now.to_string();
+            return None;
+        }
+        if entry.cap.is_empty() {
+            // the entry was created by window() tracking alone; adopting a cap
+            // is not a plan change, so stay silent
+            entry.cap = cap.to_string();
+            entry.last_seen = now.to_string();
             return None;
         }
         let prev = entry.cap.clone();
@@ -63,6 +80,38 @@ impl History {
             entry.first_seen
         ))
     }
+
+    /// Track a live quota window across refreshes. A fresh window reading ~0%
+    /// right after a provider said "usage limit reached" looks like a bug, so
+    /// spell the rollover out: `5h window just reset (was 100% at 13:36)`.
+    pub fn window(&mut self, provider: &str, window: &str, pct: f64, now: &str) -> Option<String> {
+        let key = format!("{provider}/{window}");
+        let entry = self.seen.entry(key).or_insert_with(|| Entry {
+            cap: String::new(),
+            first_seen: now.to_string(),
+            last_seen: now.to_string(),
+            prev: None,
+            last_pct: None,
+        });
+        let prev_pct = entry.last_pct.replace(pct);
+        let prev_seen = entry.last_seen.clone();
+        entry.last_seen = now.to_string();
+        match prev_pct {
+            Some(prev) if prev - pct >= ROLLOVER_DROP => Some(format!(
+                "{window} just reset (was {prev:.0}% at {})",
+                clock(&prev_seen)
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// HH:MM in the local timezone, for notes the user compares against the reset
+/// timestamps their provider CLI prints.
+fn clock(rfc3339: &str) -> String {
+    DateTime::parse_from_rfc3339(rfc3339)
+        .map(|t| t.with_timezone(&Local).format("%H:%M").to_string())
+        .unwrap_or_else(|_| rfc3339.to_string())
 }
 
 #[cfg(test)]
@@ -109,6 +158,93 @@ mod tests {
             None
         );
         assert!(h.seen.is_empty());
+    }
+
+    #[test]
+    fn a_rollover_is_reported_once_then_goes_quiet() {
+        let mut h = History::default();
+        // observe the window filling up
+        assert_eq!(
+            h.window("z.ai", "5h window", 40.0, "2026-10-10T11:00:00+00:00"),
+            None
+        );
+        assert_eq!(
+            h.window("z.ai", "5h window", 100.0, "2026-10-10T11:35:00+00:00"),
+            None
+        );
+        // the window rolls: the CLI just said "usage limit reached" yet the
+        // panel reads 1% — say why instead of looking broken
+        let note = h.window("z.ai", "5h window", 1.0, "2026-10-10T11:37:00+00:00");
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                format!(
+                    "5h window just reset (was 100% at {})",
+                    clock("2026-10-10T11:35:00+00:00")
+                )
+                .as_str()
+            )
+        );
+        // and only once
+        assert_eq!(
+            h.window("z.ai", "5h window", 3.0, "2026-10-10T11:38:00+00:00"),
+            None
+        );
+    }
+
+    #[test]
+    fn small_pct_dips_are_not_rollovers() {
+        let mut h = History::default();
+        h.window("z.ai", "weekly", 60.0, "2026-10-10T11:00:00+00:00");
+        assert_eq!(
+            h.window("z.ai", "weekly", 20.0, "2026-10-10T11:30:00+00:00"),
+            None
+        );
+        // a drop just under the threshold stays silent too
+        h.window("z.ai", "weekly", 100.0, "2026-10-10T12:00:00+00:00");
+        assert_eq!(
+            h.window("z.ai", "weekly", 51.0, "2026-10-10T12:30:00+00:00"),
+            None
+        );
+    }
+
+    #[test]
+    fn window_tracking_coexists_with_cap_notes() {
+        let mut h = History::default();
+        h.window("z.ai", "5h window", 100.0, "2026-10-10T11:35:00+00:00");
+        // adopting a cap into an entry created by window() is silent
+        assert_eq!(
+            h.note("z.ai", "5h window", "12.0k", "2026-10-10T11:36:00+00:00"),
+            None
+        );
+        assert_eq!(
+            h.note("z.ai", "5h window", "12.0k", "2026-10-10T11:37:00+00:00"),
+            None
+        );
+        let dir = std::env::temp_dir().join("aitop-test-history-pct");
+        let _ = std::fs::create_dir_all(&dir);
+        h.save(&dir);
+        let back = History::load(&dir);
+        assert_eq!(
+            back.seen.get("z.ai/5h window").and_then(|e| e.last_pct),
+            Some(100.0)
+        );
+        // the rollover still fires after a restart
+        assert_eq!(
+            {
+                let mut h2 = History::load(&dir);
+                h2.window("z.ai", "5h window", 1.0, "2026-10-10T11:40:00+00:00")
+            }
+            .as_deref(),
+            Some(
+                format!(
+                    "5h window just reset (was 100% at {})",
+                    clock("2026-10-10T11:37:00+00:00")
+                )
+                .as_str()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

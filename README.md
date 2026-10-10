@@ -7,6 +7,7 @@
 - Track Codex, Claude, Copilot, z.ai, OpenRouter, and DeepSeek in one place.
 - Inspect Strata and Ollama engine state alongside local session activity.
 - See rolling quota windows, reset countdowns, spending budgets, and usage pace.
+- Reset times include an absolute local clock (`resets in 2h30m @ 16:58`) so they can be compared with the reset timestamps provider CLIs print, and a window that rolls over from ~100% explains itself (`5h window just reset (was 100% at 13:36)`) instead of looking stuck at 0%.
 - Zoom into a provider or use the two-column overview on terminals at least 110 columns wide.
 - Distinguish live provider data, local estimates, and stale cached snapshots in panel titles.
 

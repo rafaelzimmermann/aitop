@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use serde_json::Value;
 
 use crate::config::{self, Config, Limits};
@@ -96,6 +96,20 @@ fn get_json(url: &str, key: Option<&str>, extra: &[(&str, String)]) -> Result<Va
 
 fn num(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_f64())
+}
+
+/// "resets in 2h30m @ 16:58" — the absolute clock (local time) makes the row
+/// directly comparable with the reset timestamps the provider CLI prints in
+/// its "usage limit reached" errors, e.g. z.ai's
+/// "Your limit will reset at 2026-10-10 19:14:18".
+fn resets_in(secs: u64) -> String {
+    if secs == 0 {
+        return "no reset".to_string();
+    }
+    let at = (Utc::now() + chrono::Duration::seconds(secs as i64))
+        .with_timezone(&Local)
+        .format("%H:%M");
+    format!("resets in {} @ {at}", fmt_duration(secs))
 }
 
 /// Local engines are probed on every refresh tick; an offline server must not stall
@@ -437,18 +451,12 @@ fn codex_panel(cfg: &Config, pricing: &Pricing, v: &Value) -> Panel {
                 .get("reset_after_seconds")
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0);
-            let detail = if reset > 0 {
-                format!("resets in {}", fmt_duration(reset))
-            } else {
-                "no reset".into()
-            };
-            add_row(
-                &mut p,
-                cfg,
-                Row::new(&window_label(secs), pct, detail),
-                secs,
-                reset,
-            );
+            let detail = resets_in(reset);
+            let mut r = Row::new(&window_label(secs), pct, detail);
+            if reset > 0 {
+                r.reset_at = Some(Utc::now() + chrono::Duration::seconds(reset as i64));
+            }
+            add_row(&mut p, cfg, r, secs, reset);
         }
         if rl
             .get("limit_reached")
@@ -485,11 +493,14 @@ fn codex_panel(cfg: &Config, pricing: &Pricing, v: &Value) -> Panel {
                 .get("limit_name")
                 .and_then(|x| x.as_str())
                 .unwrap_or("extra");
-            let r = Row::new(
+            let mut r = Row::new(
                 &format!("{name} {}", window_label(secs)),
                 pct,
-                format!("resets in {}", fmt_duration(reset)),
+                resets_in(reset),
             );
+            if reset > 0 {
+                r.reset_at = Some(Utc::now() + chrono::Duration::seconds(reset as i64));
+            }
             add_row(&mut p, cfg, r, secs, reset);
         }
     }
@@ -628,25 +639,17 @@ fn claude_panel(
                 _ => continue,
             };
             let pct = w.get("utilization").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let reset = match w
+            let reset_at = w
                 .get("resets_at")
                 .and_then(|x| x.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            {
-                Some(t) => (t.to_utc() - Utc::now()).num_seconds().max(0) as u64,
-                None => 0,
-            };
-            add_row(
-                &mut p,
-                cfg,
-                Row::new(
-                    &window_label(window),
-                    pct,
-                    format!("resets in {}", fmt_duration(reset)),
-                ),
-                window,
-                reset,
-            );
+                .map(|t| t.to_utc());
+            let reset = reset_at
+                .map(|t| (t - Utc::now()).num_seconds().max(0) as u64)
+                .unwrap_or(0);
+            let mut r = Row::new(&window_label(window), pct, resets_in(reset));
+            r.reset_at = reset_at;
+            add_row(&mut p, cfg, r, window, reset);
         }
         if let Some(o) = u.get("additional_utility").and_then(|x| x.as_bool()) {
             p.lines.push(format!("additional usage: {o}"));
@@ -1006,10 +1009,12 @@ fn add_quota_rows(p: &mut Panel, limits: &[&Value]) {
             r.set_cap(&fmt_tokens(total as u64));
         }
         if let Some(ms) = l.get("nextResetTime").and_then(|x| x.as_f64()) {
-            let secs = (ms / 1000.0) as u64;
-            let now = Utc::now().timestamp() as u64;
-            if secs > now {
-                r.pace = Some(format!("resets in {}", fmt_duration(secs - now)))
+            if let Some(at) = DateTime::from_timestamp_millis(ms as i64) {
+                r.reset_at = Some(at);
+                let remaining = (at - Utc::now()).num_seconds().max(0) as u64;
+                if remaining > 0 {
+                    r.pace = Some(resets_in(remaining));
+                }
             }
         }
         p.rows.push(r);
@@ -1866,6 +1871,17 @@ fn cap_notes(hist: &mut history::History, p: &Panel, now: &str) -> Vec<String> {
         .collect()
 }
 
+/// Windows that rolled over since the last sighting. A provider's "usage
+/// limit reached" error is followed seconds later by a fresh window reading
+/// ~0%; without this note that jump looks like a broken gauge.
+fn rollover_notes(hist: &mut history::History, p: &Panel, now: &str) -> Vec<String> {
+    p.rows
+        .iter()
+        .filter(|r| r.reset_at.is_some())
+        .filter_map(|r| hist.window(&p.name, &r.label, r.pct, now))
+        .collect()
+}
+
 fn fetch_provider(cfg: &Config, pricing: &Pricing, name: &str) -> Panel {
     match name {
         "codex" => codex(cfg, pricing),
@@ -1904,6 +1920,8 @@ pub fn fetch_all(cfg: &Config, pricing: &Pricing) -> Snapshot {
         merge_cached(cfg, p);
         let notes = cap_notes(&mut hist, p, &now);
         p.lines.extend(notes);
+        let rolls = rollover_notes(&mut hist, p, &now);
+        p.lines.extend(rolls);
     }
     hist.save(&cfg.cache_dir);
     Snapshot {
@@ -2017,7 +2035,8 @@ mod tests {
         assert_eq!(p.subtitle, "plus · me@example.com");
         assert_eq!(p.rows.len(), 3);
         assert_eq!(p.rows[0].label, "5h window");
-        assert_eq!(p.rows[0].detail, "resets in 2h30m");
+        assert!(p.rows[0].detail.starts_with("resets in 2h30m @ "));
+        assert!(p.rows[0].reset_at.is_some());
         // 3% used halfway through the window → far ahead of schedule
         assert_eq!(p.rows[0].pace.as_deref(), Some("pace ahead 47%"));
         // 44% vs 50.4% expected → inside the trigger band

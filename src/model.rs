@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+
 /// Filled and empty cells of a fixed-width bar (pct is clamped to 0..100).
 pub fn bar_parts(pct: f64, width: usize) -> (usize, usize) {
     let filled = ((pct / 100.0).clamp(0.0, 1.0) * width as f64).round() as usize;
@@ -25,6 +27,9 @@ pub struct Row {
     pub pace: Option<String>,
     /// cap in use for this window, as displayed (e.g. "200.0k", "$30.00")
     pub cap: Option<String>,
+    /// when this window resets, if the provider reports it (drives rollover notes)
+    #[serde(default)]
+    pub reset_at: Option<DateTime<Utc>>,
 }
 
 impl Row {
@@ -35,6 +40,7 @@ impl Row {
             detail,
             pace: None,
             cap: None,
+            reset_at: None,
         }
     }
 
@@ -173,6 +179,7 @@ mod tests {
         let r = Row::new("daily", 10.0, "x".into());
         assert_eq!(r.pace, None);
         assert_eq!(r.cap, None);
+        assert_eq!(r.reset_at, None);
         let p = Panel::new("codex");
         assert_eq!(p.source, None);
         assert!(!p.stale);
