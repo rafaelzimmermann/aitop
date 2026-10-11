@@ -30,13 +30,22 @@ Alternatively, the Bash installer builds a release binary into `~/.local/bin` an
 
 ```bash
 ./install.sh
+./install.sh --check              # report build dependencies (toolchain, network) and exit
 ./install.sh --run                # install and print a snapshot
+./install.sh --offline            # build without network (crates must already be cached)
+./install.sh --rust-default       # set the rustup default toolchain, then build
 ./install.sh --prefix /usr/local  # choose an installation prefix
 ./install.sh --no-config          # skip config creation
 ./install.sh --uninstall          # remove the installed binary
 ```
 
-The installer uses `readlink -f`; on systems without it, use `cargo install` above. Ensure the chosen binary directory is on your `PATH`.
+The installer probes the Rust toolchain before building, so a `rustup` install with no default
+toolchain still works: it builds via `rustup run stable cargo` and tells you how to fix it once
+(`rustup default stable`). Use `--check` to see the dependency report without building, and
+`--offline` when the crates are already in `${CARGO_HOME:-~/.cargo}/registry`. Ensure the chosen
+binary directory is on your `PATH`.
+
+The installer is self-contained (no `readlink -f` required), so it works on BSD/macOS shells too.
 
 ## Quick start
 
