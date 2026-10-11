@@ -3,6 +3,7 @@ name = "aitop"
 version = "0.1.0"
 edition = "2021"
 description = "htop for AI usage: live quota dashboard for Codex, Claude, Copilot, z.ai and OpenRouter"
+license = "MIT"
 
 [dependencies]
 ratatui = "0.29"

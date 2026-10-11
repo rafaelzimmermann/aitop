@@ -162,3 +162,8 @@ cargo build --locked
 ```
 
 The live render and plain snapshot commands use your configured credentials and endpoints. See [AGENTS.md](AGENTS.md) for architecture and contribution conventions.
+
+## License
+
+Distributed under the [MIT License](LICENSE).
+
